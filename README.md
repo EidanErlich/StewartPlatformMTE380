@@ -18,7 +18,6 @@ Run the setup script to create a virtual environment and install dependencies:
 ```bash
 bash setup_env.sh
 ```
-```
 
 ## Running the Visualization
 
@@ -28,6 +27,7 @@ Once the environment is set up and activated:
 source venv/bin/activate
 python3 inverseKinematics.py
 ```
+
 ## Sources
 
 - [Inverse Kinematics of a Stewart Platform](https://raw.org/research/inverse-kinematics-of-a-stewart-platform/)
