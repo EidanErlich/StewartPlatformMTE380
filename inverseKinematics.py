@@ -3,11 +3,16 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 
-# === GLOBAL PARAMETERS (update as needed) ===
-SERVO_HORN_LENGTH = 10.0  # |h|, length from servo shaft to hinge (servo horn)
-ROD_LENGTH = 15.0         # |d|, length from hinge to plate anchor (rod)
-PLATE_RADIUS = 13.0        # pr, radius of the circular plate
-BASE_RADIUS = 8.0        # br, radius of the base circle
+# === GLOBAL PARAMETERS (update as needed) === (All units in cm)
+SERVO_HORN_LENGTH = 8.0  # |h|, length from servo shaft to hinge (servo horn)
+ROD_LENGTH = 9.4         # |d|, length from hinge to plate anchor (rod)
+PLATE_RADIUS = 14.0        # pr, radius of the circular plate
+BASE_RADIUS = 5.0        # br, radius of the base circle
+
+# Per-servo zero-angle calibration offsets (in degrees).
+# Positive values mean the physical "zero" sits at +offset degrees and you must add the offset
+# to the computed angle before commanding the servo. Tune these per motor.
+SERVO_ZERO_OFFSETS_DEG = np.array([17.0, 21.0, 17.0])
 
 
 
@@ -22,6 +27,8 @@ class StewartPlatform:
 		self.servo_betas = self._calculate_servo_betas(3)
 		# Calculate the optimal neutral height (where horn and rod are orthogonal)
 		self.neutral_height = self._calculate_neutral_height()
+		# Copy of zero-angle offsets (deg) used to bias command outputs
+		self.servo_zero_offsets_deg = SERVO_ZERO_OFFSETS_DEG.copy()
 
 	def _calculate_circle_points(self, radius, num_points, z=0):
 		angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
@@ -50,9 +57,10 @@ class StewartPlatform:
 			print(f"  Planar distance: {np.sqrt(planar_dist_sq):.2f}")
 			print(f"  Max reach: {np.sqrt(ROD_LENGTH**2 + SERVO_HORN_LENGTH**2):.2f}")
 			return 10.0  # fallback
-		return np.sqrt(z_sq)
+		# Add extra height offset to raise platform higher
+		return np.sqrt(z_sq) + 3.0
 
-	def calculate_servo_angles(self, plate_normal, translation=None):
+	def calculate_servo_angles(self, plate_normal, translation=None, *, degrees=False, apply_offsets=False, clamp_min=None, clamp_max=None):
 		"""
 		Calculate the servo angles (alpha_k) for a given plate orientation (normal) and translation.
 		Args:
@@ -94,6 +102,16 @@ class StewartPlatform:
 			arg = np.clip(g_k / denom, -1.0, 1.0)
 			alpha_k = np.arcsin(arg) - np.arctan2(f_k, e_k)
 			self.servo_angles[k] = alpha_k
+
+		# Optionally apply zero offsets and clamping, returning degrees
+		if apply_offsets or (clamp_min is not None and clamp_max is not None) or degrees:
+			angles_deg = np.degrees(self.servo_angles)
+			if apply_offsets:
+				angles_deg = angles_deg + self.servo_zero_offsets_deg
+			if clamp_min is not None and clamp_max is not None:
+				angles_deg = np.clip(angles_deg, clamp_min, clamp_max)
+			return angles_deg
+
 		return self.servo_angles
 
 	def get_platform_points(self, plate_normal, translation=None):
@@ -199,8 +217,12 @@ class StewartPlatformVisualizer:
 def main():
 	plt.ion()  # Enable interactive mode
 	platform = StewartPlatform()
+	
+	# Initialize servos to 0 degrees manually
+	platform.servo_angles = np.array([0.0, 0.0, 0.0])
+	
 	visualizer = StewartPlatformVisualizer(platform)
-	# Initial normal vector
+	# Initial normal vector (vertical)
 	normal = np.array([0, 0, 1], dtype=float)
 	
 	# Tilt limits (max deviation from vertical in radians)

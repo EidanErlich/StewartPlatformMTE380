@@ -55,8 +55,10 @@ class ArduinoStewartController:
                 print(f"Arduino: {line}")
             
             print(f"Connected to Arduino on {port} at {baud} baud")
-            print("Initializing platform to neutral position...")
-            self.update_platform()
+            print("Initializing all servos to 0 degrees...")
+            # Send all servos to 0 degrees directly
+            self.send_angles([0, 0, 0])
+            print("Servos initialized: [0°, 0°, 0°]")
             
         except serial.SerialException as e:
             print(f"Failed to connect to {port}: {e}")
@@ -82,9 +84,14 @@ class ArduinoStewartController:
     
     def update_platform(self):
         """Calculate servo angles and send to Arduino"""
-        # Calculate servo angles for current normal
-        angles_rad = self.platform.calculate_servo_angles(self.normal)
-        angles_deg = np.degrees(angles_rad)
+        # Calculate servo command angles (deg) with zero offsets and clamp to 0..65
+        angles_deg = self.platform.calculate_servo_angles(
+            self.normal,
+            degrees=True,
+            apply_offsets=True,
+            clamp_min=0.0,
+            clamp_max=65.0,
+        )
         
         # Send to Arduino
         success = self.send_angles(angles_deg)
