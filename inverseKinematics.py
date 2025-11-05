@@ -6,8 +6,8 @@ from mpl_toolkits.mplot3d import Axes3D
 # === GLOBAL PARAMETERS (update as needed) ===
 SERVO_HORN_LENGTH = 10.0  # |h|, length from servo shaft to hinge (servo horn)
 ROD_LENGTH = 15.0         # |d|, length from hinge to plate anchor (rod)
-PLATE_RADIUS = 8.0        # pr, radius of the circular plate
-BASE_RADIUS = 13.0        # br, radius of the base circle
+PLATE_RADIUS = 13.0        # pr, radius of the circular plate
+BASE_RADIUS = 8.0        # br, radius of the base circle
 
 
 
@@ -30,13 +30,10 @@ class StewartPlatform:
 		])
 
 	def _calculate_servo_betas(self, num_servos):
-		# Tangential orientation for each servo horn
-		# For a 3-servo system with circular arrangement, servos are tangent to base circle
-		# Tangent at angle theta is perpendicular, so beta = theta + 90°
 		betas = []
 		for k in range(3):
 			base_angle = 2 * np.pi * k / 3  # 0°, 120°, 240°
-			beta_k = base_angle + np.pi / 2  # Tangent direction
+			beta_k = base_angle              # Outward radial direction
 			betas.append(beta_k)
 		return np.array(betas)
 	
