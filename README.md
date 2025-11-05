@@ -49,7 +49,7 @@ Or use the PlatformIO IDE buttons in VSCode.
 
 ### Behavior
 
-The servos will automatically jog in a smooth sinusoidal motion pattern. No user control needed - the motion starts immediately after upload.
+Control the platform using arrow keys, run the arduino controller python file, after uploading the arduino code.
 
 ### Configuration
 
