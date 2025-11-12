@@ -52,6 +52,43 @@ def make_blob_detector(min_area=50, max_area=500, min_circ=0.5, dark=True, min_s
     return cv2.SimpleBlobDetector_create(params)
 
 
+def refine_centroid_subpixel(gray, pt, win=11):
+    """
+    Refine a blob center to subpixel accuracy using a small local patch.
+    Assumes dark blobs on lighter background (inverts patch).
+    """
+    h, w = gray.shape[:2]
+    x0 = int(round(pt[0]))
+    y0 = int(round(pt[1]))
+    half = win // 2
+    x1 = max(0, x0 - half)
+    x2 = min(w, x0 + half + 1)
+    y1 = max(0, y0 - half)
+    y2 = min(h, y0 + half + 1)
+    patch = gray[y1:y2, x1:x2]
+    if patch.size == 0:
+        return np.array(pt, dtype=np.float32)
+    # Make blobs bright by inverting local patch (dark blobs -> bright)
+    vals = 255 - patch.astype(np.float32)
+    # Simple adaptive threshold relative to mean; this keeps it robust
+    thr = np.mean(vals) * 0.35
+    mask = (vals > thr).astype(np.uint8)
+    M = cv2.moments(mask, binaryImage=True)
+    if M.get("m00", 0) != 0:
+        cx = (M["m10"] / M["m00"]) + x1
+        cy = (M["m01"] / M["m00"]) + y1
+        return np.array([cx, cy], dtype=np.float32)
+    # fallback to intensity-weighted centroid
+    s = np.sum(vals)
+    if s > 1e-6:
+        cols = np.arange(x1, x2)
+        rows = np.arange(y1, y2)
+        cx = (cols * np.sum(vals, axis=0)).sum() / s
+        cy = (rows * np.sum(vals, axis=1)).sum() / s
+        return np.array([cx, cy], dtype=np.float32)
+    return np.array(pt, dtype=np.float32)
+
+
 def pair_points_by_distance(pts, expected_pairs=3, max_pair_px=None):
     """
     Greedy nearest pairing. Optionally discard pairs longer than max_pair_px.
@@ -191,6 +228,10 @@ def main():
                     "This makes the rotation/normal estimation depend only on the angular placement of the points, not the physical radius.")
     ap.add_argument("--normal_ma_window", type=int, default=5,
                 help="Window size (frames) for moving-average smoothing of the normal (default: 5)")
+    ap.add_argument("--pair_sep_m", type=float, default=None,
+                help="Optional: known physical separation (meters) between two screws in a pair. Enables strict pair filtering.")
+    ap.add_argument("--pair_sep_tol", type=float, default=0.4,
+                help="Tolerance fraction for --pair_sep_m when filtering pairs (default: 0.4 = ±40%)")
     args = ap.parse_args()
 
     # Load intrinsics
@@ -258,9 +299,11 @@ def main():
             disp = cv2.undistort(frame, K, dist, None, newK)
 
         # --- Detect screws as dark blobs ---
-        keypoints = detector.detect(gray)
+        # Pre-blur to reduce sensor speckle that causes jitter
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        keypoints = detector.detect(blurred)
 
-        # Filter by size (diameter) - estimate expected pixel diameter for 1cm
+        # Filter by size (diameter) - estimate expected pixel diameter for point size
         fx = K[0, 0]
         expected_diameter_px = (args.point_diameter_m * fx) / args.working_distance_m
         min_diameter_px = expected_diameter_px * 0.5  # Allow 50% smaller
@@ -273,7 +316,12 @@ def main():
                 filtered_keypoints.append(kp)
         keypoints = filtered_keypoints
 
-        pts = np.array([kp.pt for kp in keypoints], dtype=np.float32) if keypoints else np.empty((0, 2), dtype=np.float32)
+        # refine each keypoint to subpixel centroid (use original gray for detail)
+        if keypoints:
+            refined_pts = [refine_centroid_subpixel(gray, kp.pt, win=11) for kp in keypoints]
+            pts = np.array(refined_pts, dtype=np.float32)
+        else:
+            pts = np.empty((0, 2), dtype=np.float32)
 
         # Enforce pair property early: only keep blobs that belong to mutual nearest-neighbor pairs.
         # This removes stray single blobs that don't have a partner and reduces false positives.
@@ -281,17 +329,30 @@ def main():
             # ask for as many disjoint mutual pairs as possible
             candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=args.max_pair_px)
             if candidate_pairs:
-                used_idx = set()
-                for a, b in candidate_pairs:
-                    used_idx.add(int(a))
-                    used_idx.add(int(b))
-                # Rebuild keypoints and pts to only include points that are part of a mutual pair
-                keep_indices = sorted(used_idx)
-                keypoints = [keypoints[i] for i in keep_indices]
-                pts = np.array([kp.pt for kp in keypoints], dtype=np.float32)
+                # optional: if physical pair separation is known, filter pairs by expected pixel separation
+                if args.pair_sep_m is not None and len(candidate_pairs) > 0:
+                    expected_px = (args.pair_sep_m * fx) / args.working_distance_m
+                    tol_px = expected_px * args.pair_sep_tol
+                    filtered_pairs = []
+                    for a, b in candidate_pairs:
+                        d = float(np.linalg.norm(pts[int(a)] - pts[int(b)]))
+                        if abs(d - expected_px) <= tol_px:
+                            filtered_pairs.append((a, b))
+                    candidate_pairs = filtered_pairs
+
+                if candidate_pairs:
+                    used_idx = set()
+                    for a, b in candidate_pairs:
+                        used_idx.add(int(a))
+                        used_idx.add(int(b))
+                    # Rebuild keypoints and pts to only include points that are part of a mutual pair
+                    keep_indices = sorted(used_idx)
+                    # update keypoints from refined pts
+                    keypoints = [cv2.KeyPoint(float(pts[i][0]), float(pts[i][1]), 1.0) for i in keep_indices]
+                    pts = np.array([kp.pt for kp in keypoints], dtype=np.float32)
 
         for kp in keypoints:
-            cv2.circle(disp, (int(kp.pt[0]), int(kp.pt[1])), max(2, int(kp.size / 2)), (0, 255, 255), 2)
+            cv2.circle(disp, (int(kp.pt[0]), int(kp.pt[1])), max(2, int(kp.size / 2) if hasattr(kp, 'size') else 3), (0, 255, 255), 2)
 
         img_pts_3 = None
         pairs = []
