@@ -5,6 +5,7 @@ import argparse
 import itertools
 import json
 from math import atan2, acos, degrees
+from collections import deque
 
 # ---- FIXED PLATE GEOMETRY (your setup) ----
 RADIUS_M = 0.15                  # 15 cm
@@ -186,8 +187,10 @@ def main():
     ap.add_argument("--point_smooth_alpha", type=float, default=0.3, help="Point smoothing factor (0-1, lower=more smoothing, default: 0.3)")
     ap.add_argument("--debug", action="store_true", help="Enable debug prints for P3P/pose estimation failures")
     ap.add_argument("--use_unit_model", action="store_true",
-                    help="Use a unit-radius model for the three plate points (ignore RADIUS_M).\n"
-                         "This makes the rotation/normal estimation depend only on the angular placement of the points, not the physical radius.")
+                help="Use a unit-radius model for the three plate points (ignore RADIUS_M).\n"
+                    "This makes the rotation/normal estimation depend only on the angular placement of the points, not the physical radius.")
+    ap.add_argument("--normal_ma_window", type=int, default=5,
+                help="Window size (frames) for moving-average smoothing of the normal (default: 5)")
     args = ap.parse_args()
 
     # Load intrinsics
@@ -226,8 +229,12 @@ def main():
         return
 
     print("Controls: q/ESC=quit, n=print normal/angles, (optional) --json for machine-readable stream.")
-    alpha = 0.25  # smoothing for the normal
+    alpha = 0.25  # smoothing for the normal (EMA)
     normal_smoothed = None
+    # previous EMA state for normals
+    normal_ema = None
+    # combined EMA + moving-average buffer for reducing jitter in normal estimates
+    normals_buffer = deque(maxlen=args.normal_ma_window)
     best_err = None
     points_found = False
 
@@ -436,12 +443,27 @@ def main():
                 if np.dot(n, cam_to_plate) < 0:
                     n *= -1
 
-                # Smooth
-                if normal_smoothed is None:
-                    normal_smoothed = n.copy()
+                # Smooth: combine an EMA (short-term smoothing) with a moving-average over recent EMA values
+                if normal_ema is None:
+                    normal_ema = n.copy()
                 else:
-                    normal_smoothed = (1 - alpha) * normal_smoothed + alpha * n
-                    normal_smoothed /= np.linalg.norm(normal_smoothed)
+                    normal_ema = (1 - alpha) * normal_ema + alpha * n
+                # normalize EMA
+                try:
+                    normal_ema /= np.linalg.norm(normal_ema)
+                except Exception:
+                    pass
+
+                # append EMA to buffer and compute moving-average
+                normals_buffer.append(normal_ema.copy())
+                na = np.array(normals_buffer)
+                normal_ma = np.mean(na, axis=0)
+                # normalize final smoothed normal
+                norm = np.linalg.norm(normal_ma)
+                if norm > 1e-8:
+                    normal_smoothed = normal_ma / norm
+                else:
+                    normal_smoothed = normal_ma
 
                 # Angles
                 inc = acos(np.clip(normal_smoothed[2], -1.0, 1.0))          # radians
