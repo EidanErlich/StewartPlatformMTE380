@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Stewart Platform 1D PID Controller with GUI
 Real-time PID tuning interface for single-servo ball balancing.
@@ -136,6 +135,12 @@ class StewartPIDController:
         output = P + I + D
         
         return output
+    def get_position_for_servo(self, x_m, y_m, servo_index):
+        angle = np.radians(servo_index * 120)
+        
+        position_1d = y_m * np.cos(angle) + x_m * np.sin(angle)
+        
+        return position_1d
     
     def camera_thread(self):
         """Video capture and ball detection thread"""
@@ -153,7 +158,7 @@ class StewartPIDController:
             
             if found:
                 # Use Y-axis for control
-                position_m = y_m
+                position_m = position_m = self.get_position_for_servo(x_m, y_m, self.control_servo)
                 # Update position queue (keep only latest)
                 try:
                     if self.position_queue.full():
