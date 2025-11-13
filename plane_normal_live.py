@@ -2,14 +2,20 @@
 import cv2
 import numpy as np
 import argparse
-import itertools
-import json
-from math import atan2, acos, degrees
-from collections import deque
 
 # ---- FIXED PLATE GEOMETRY (your setup) ----
-RADIUS_M = 0.15                  # 15 cm
 ANGLES_DEG = [0.0, 120.0, 240.0]  # evenly spaced, CCW from +X
+
+# ---- RUNTIME CONFIG (hardcoded, not CLI) ----
+# Only --calib and --cam are accepted on the command line; everything else is fixed here.
+PREVIEW = False                 # undistort preview window
+JSON_OUTPUT = False             # print one-line JSON each frame
+MAX_PAIR_PX = None              # optional max pixel distance to accept screw pairs
+POINT_DIAMETER_M = 0.01        # expected point diameter in meters (1cm)
+WORKING_DISTANCE_M = 0.5       # estimated working distance in meters
+POINT_SMOOTH_ALPHA = 0.3       # point smoothing factor (0-1)
+PAIR_SEP_M = None              # known physical separation (meters) between two screws in a pair
+PAIR_SEP_TOL = 0.4             # tolerance fraction for PAIR_SEP_M when filtering pairs
 
 
 def estimate_pixel_area_for_size(physical_diameter_m, K, working_distance_m=0.5):
@@ -138,100 +144,11 @@ def pair_points_by_distance(pts, expected_pairs=3, max_pair_px=None):
     return pairs
 
 
-def solve_p3p_best(obj3, img3, K, dist):
-    # Run P3P and pick the solution with minimum reprojection error
-    obj3 = np.asarray(obj3)
-    img3 = np.asarray(img3)
-    npts = obj3.shape[0]
-
-    # Ensure proper dtypes for OpenCV
-    obj3_f = obj3.astype(np.float32)
-    img3_f = img3.astype(np.float32)
-    K_f = K.astype(np.float64)
-    dist_f = dist.astype(np.float64)
-
-    rvecs = []
-    tvecs = []
-
-    if npts >= 4:
-        # Use generic multi-solution solver when 4+ points available
-        try:
-            ok, rvecs_out, tvecs_out, _ = cv2.solvePnPGeneric(obj3_f, img3_f, K_f, dist_f, flags=cv2.SOLVEPNP_ITERATIVE)
-        except Exception:
-            return None
-        if not ok or len(rvecs_out) == 0:
-            return None
-        rvecs = rvecs_out
-        tvecs = tvecs_out
-    elif npts == 3:
-        # Fallback: use solvePnP (P3P) when exactly 3 points are given.
-        try:
-            res = cv2.solvePnP(obj3_f, img3_f, K_f, dist_f, flags=cv2.SOLVEPNP_P3P)
-        except Exception:
-            return None
-        # cv2.solvePnP can return either (retval, rvec, tvec) or (rvec, tvec) depending on OpenCV build
-        if isinstance(res, tuple) and len(res) == 3:
-            retval, rvec, tvec = res
-            if not bool(retval):
-                return None
-        else:
-            rvec, tvec = res
-        rvecs = [rvec]
-        tvecs = [tvec]
-    else:
-        return None
-
-    best = None
-    best_err = 1e9
-    for rvec, tvec in zip(rvecs, tvecs):
-        proj, _ = cv2.projectPoints(obj3.astype(np.float32), rvec, tvec, K_f, dist_f)
-        err = np.mean(np.linalg.norm(proj.reshape(-1, 2) - img3.astype(np.float32), axis=1))
-        if err < best_err:
-            best_err = err
-            best = (rvec, tvec, best_err)
-    return best  # (rvec, tvec, err)
-
-
-def refine_pose(obj3, img3, K, dist, rvec, tvec):
-    """Levenberg-Marquardt refinement for a more stable normal."""
-    try:
-        rvec, tvec = cv2.solvePnPRefineLM(
-            obj3.astype(np.float32),
-            img3.astype(np.float32),
-            K, dist, rvec, tvec
-        )
-    except Exception:
-        pass
-    return rvec, tvec
-
-
-def normal_from_rvec(rvec):
-    R, _ = cv2.Rodrigues(rvec)
-    n = (R @ np.array([0.0, 0.0, 1.0])).ravel()
-    n /= np.linalg.norm(n)
-    return n
-
 
 def main():
     ap = argparse.ArgumentParser(description="Live plane-normal estimation from 6 screws (3 pairs) on a circular plate.")
     ap.add_argument("--calib", type=str, default="camera_calib.npz", help="npz with K, dist")
     ap.add_argument("--cam", type=int, default=0, help="camera index")
-    ap.add_argument("--preview", action="store_true", help="undistort preview window")
-    ap.add_argument("--json", action="store_true", help="print one-line JSON each frame (for downstream parsing)")
-    ap.add_argument("--max_pair_px", type=float, default=None, help="optional max pixel distance to accept screw pairs")
-    ap.add_argument("--point_diameter_m", type=float, default=0.01, help="Expected point diameter in meters (default: 0.01 = 1cm)")
-    ap.add_argument("--working_distance_m", type=float, default=0.5, help="Estimated working distance in meters (default: 0.5m)")
-    ap.add_argument("--point_smooth_alpha", type=float, default=0.3, help="Point smoothing factor (0-1, lower=more smoothing, default: 0.3)")
-    ap.add_argument("--debug", action="store_true", help="Enable debug prints for P3P/pose estimation failures")
-    ap.add_argument("--use_unit_model", action="store_true",
-                help="Use a unit-radius model for the three plate points (ignore RADIUS_M).\n"
-                    "This makes the rotation/normal estimation depend only on the angular placement of the points, not the physical radius.")
-    ap.add_argument("--normal_ma_window", type=int, default=5,
-                help="Window size (frames) for moving-average smoothing of the normal (default: 5)")
-    ap.add_argument("--pair_sep_m", type=float, default=None,
-                help="Optional: known physical separation (meters) between two screws in a pair. Enables strict pair filtering.")
-    ap.add_argument("--pair_sep_tol", type=float, default=0.4,
-                help="Tolerance fraction for --pair_sep_m when filtering pairs (default: 0.4 = ±40%)")
     args = ap.parse_args()
 
     # Load intrinsics
@@ -241,25 +158,23 @@ def main():
 
     # Build model points for 3 joint centers (z=0)
     thetas = np.radians(ANGLES_DEG)
-    model_radius = 1.0 if args.use_unit_model else RADIUS_M
-    if args.use_unit_model:
-        print("Using unit-radius model for pose estimation: normal will be independent of RADIUS_M")
+    model_radius = 1.0
     obj_pts_3 = np.array([[model_radius * np.cos(t), model_radius * np.sin(t), 0.0] for t in thetas],
                          dtype=np.float64)
 
     # Estimate pixel area and diameter for the expected point size
-    est_area = estimate_pixel_area_for_size(args.point_diameter_m, K, args.working_distance_m)
+    est_area = estimate_pixel_area_for_size(POINT_DIAMETER_M, K, WORKING_DISTANCE_M)
     fx = K[0, 0]
-    expected_diameter_px = (args.point_diameter_m * fx) / args.working_distance_m
-    min_diameter_px = expected_diameter_px * 0.5
-    max_diameter_px = expected_diameter_px * 1.5
+    expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
+    min_diameter_px = expected_diameter_px * 0.7
+    max_diameter_px = expected_diameter_px * 1.3
     # Use a range around the estimated area (±50% tolerance)
     min_area = int(est_area * 0.3)  # Allow some smaller
     max_area = int(est_area * 2.0)  # Allow some larger
-    print(f"Point detection: {args.point_diameter_m * 1000:.1f}mm diameter")
+    print(f"Point detection: {POINT_DIAMETER_M * 1000:.1f}mm diameter")
     print(f"  Estimated pixel diameter: {expected_diameter_px:.1f} px (range: {min_diameter_px:.1f}-{max_diameter_px:.1f} px)")
     print(f"  Estimated pixel area: {est_area:.1f} px (range: {min_area}-{max_area} px)")
-    print(f"  Point smoothing alpha: {args.point_smooth_alpha:.2f}")
+    print(f"  Point smoothing alpha: {POINT_SMOOTH_ALPHA:.2f}")
 
     # Detector tuned for ~1cm diameter dark, round points
     detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
@@ -269,14 +184,7 @@ def main():
         print("ERROR: cannot open camera")
         return
 
-    print("Controls: q/ESC=quit, n=print normal/angles, (optional) --json for machine-readable stream.")
-    alpha = 0.25  # smoothing for the normal (EMA)
-    normal_smoothed = None
-    # previous EMA state for normals
-    normal_ema = None
-    # combined EMA + moving-average buffer for reducing jitter in normal estimates
-    normals_buffer = deque(maxlen=args.normal_ma_window)
-    best_err = None
+    print("Controls: q/ESC=quit, n=print pair info; script now only performs blob detection and pairing.")
     points_found = False
 
     # Point smoothing buffers
@@ -284,7 +192,53 @@ def main():
     smoothed_midpoints = None
     # smoothed_blobs: EMA for the full 6 detected blob coordinates (order: for each pair, the two points in the same order as `pairs`)
     smoothed_blobs = None
-    point_smooth_alpha = args.point_smooth_alpha
+    point_smooth_alpha = POINT_SMOOTH_ALPHA
+
+    # --- Mouse / motor assignment state ---
+    motor_assignments = {}  # map 'A'/'B'/'C' -> stored (x,y) coordinates (np.array)
+    motor_order = ['A', 'B', 'C']
+    next_motor_idx = 0
+    cursor_pt = None
+    # Colors for motor highlights (B, G, R)
+    motor_colors = {'A': (0, 0, 255), 'B': (255, 0, 0), 'C': (0, 255, 0)}
+
+    # Mouse callback to track cursor and assign motors on left-click
+    def on_mouse(event, x, y, flags, param):
+        nonlocal cursor_pt, motor_assignments, next_motor_idx
+        if event == cv2.EVENT_MOUSEMOVE:
+            cursor_pt = np.array([float(x), float(y)], dtype=np.float32)
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            # Safely check for detected points in this scope
+            if 'pts' not in locals() or pts is None or len(pts) == 0:
+                print("No detected blobs to assign.")
+                return
+            click = np.array([float(x), float(y)], dtype=np.float32)
+            # find nearest detected blob
+            dists = np.linalg.norm(pts - click, axis=1)
+            idx = int(np.argmin(dists))
+            min_dist = float(dists[idx])
+            # threshold: ignore clicks that are clearly far from blobs
+            if min_dist > 50.0:
+                print(f"Click too far from nearest blob ({min_dist:.1f}px); ignore.")
+                return
+            candidate = pts[idx]
+            # check if this blob (or a blob very near it) is already assigned
+            for k, v in motor_assignments.items():
+                if np.linalg.norm(v - candidate) < 8.0:
+                    print(f"Blob already assigned to motor {k}")
+                    return
+            if next_motor_idx >= len(motor_order):
+                print("All motors already assigned. Press 'r' to reset assignments.")
+                return
+            name = motor_order[next_motor_idx]
+            motor_assignments[name] = candidate.copy()
+            next_motor_idx += 1
+            print(f"Assigned motor {name} to blob at {candidate}")
+
+    # create window and register mouse callback
+    win_name = "plane normal (live)"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win_name, on_mouse)
 
     while True:
         ok, frame = cap.read()
@@ -294,7 +248,7 @@ def main():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         disp = frame.copy()
 
-        if args.preview:
+        if PREVIEW:
             newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (frame.shape[1], frame.shape[0]), 0)
             disp = cv2.undistort(frame, K, dist, None, newK)
 
@@ -305,7 +259,7 @@ def main():
 
         # Filter by size (diameter) - estimate expected pixel diameter for point size
         fx = K[0, 0]
-        expected_diameter_px = (args.point_diameter_m * fx) / args.working_distance_m
+        expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
         min_diameter_px = expected_diameter_px * 0.5  # Allow 50% smaller
         max_diameter_px = expected_diameter_px * 1.5  # Allow 50% larger
 
@@ -327,12 +281,12 @@ def main():
         # This removes stray single blobs that don't have a partner and reduces false positives.
         if len(pts) >= 2:
             # ask for as many disjoint mutual pairs as possible
-            candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=args.max_pair_px)
+            candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=MAX_PAIR_PX)
             if candidate_pairs:
                 # optional: if physical pair separation is known, filter pairs by expected pixel separation
-                if args.pair_sep_m is not None and len(candidate_pairs) > 0:
-                    expected_px = (args.pair_sep_m * fx) / args.working_distance_m
-                    tol_px = expected_px * args.pair_sep_tol
+                if PAIR_SEP_M is not None and len(candidate_pairs) > 0:
+                    expected_px = (PAIR_SEP_M * fx) / WORKING_DISTANCE_M
+                    tol_px = expected_px * PAIR_SEP_TOL
                     filtered_pairs = []
                     for a, b in candidate_pairs:
                         d = float(np.linalg.norm(pts[int(a)] - pts[int(b)]))
@@ -354,49 +308,41 @@ def main():
         for kp in keypoints:
             cv2.circle(disp, (int(kp.pt[0]), int(kp.pt[1])), max(2, int(kp.size / 2) if hasattr(kp, 'size') else 3), (0, 255, 255), 2)
 
-        img_pts_3 = None
+        # Compute pairs and midpoints for however many mutual pairs we can find
+        img_pts = None
         pairs = []
-        if len(pts) >= 6:
-            # Pair into 3 nearest pairs; optional distance limit to avoid cross-pairing
-            pairs = pair_points_by_distance(pts, expected_pairs=3, max_pair_px=args.max_pair_px)
-            if len(pairs) == 3:
+        if len(pts) >= 2:
+            # Find as many disjoint mutual pairs as possible
+            pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=MAX_PAIR_PX)
+            if pairs:
                 midpts = []
+                blobs = []
                 for (i, j) in pairs:
                     p = 0.5 * (pts[i] + pts[j])
                     midpts.append(p)
                     cv2.line(disp, tuple(pts[i].astype(int)), tuple(pts[j].astype(int)), (0, 200, 0), 2)
                     cv2.circle(disp, tuple(p.astype(int)), 6, (255, 0, 0), -1)
+                    # keep the two blob points in the same order as the pair
+                    blobs.append(pts[i])
+                    blobs.append(pts[j])
+
                 midpts_array = np.array(midpts, dtype=np.float64)
+                blobs_array = np.array(blobs, dtype=np.float64).reshape((-1, 2))
 
-                # Build the flat list of 6 image points (two per pair) in the same pair order
-                blobs6 = []
-                pair_pixel_seps = []
-                for (i, j) in pairs:
-                    p1 = pts[i]
-                    p2 = pts[j]
-                    blobs6.append(p1)
-                    blobs6.append(p2)
-                    pair_pixel_seps.append(np.linalg.norm(p1 - p2))
-                blobs6_array = np.array(blobs6, dtype=np.float64).reshape((6, 2))
-
-                # Apply smoothing to midpoints (for display)
-                if smoothed_midpoints is None:
+                # Apply smoothing to midpoints (handle variable number of pairs)
+                if smoothed_midpoints is None or smoothed_midpoints.shape[0] != midpts_array.shape[0]:
                     smoothed_midpoints = midpts_array.copy()
                 else:
                     smoothed_midpoints = (1 - point_smooth_alpha) * smoothed_midpoints + point_smooth_alpha * midpts_array
 
-                # Apply smoothing to the 6 blob points (preserve ordering)
-                if smoothed_blobs is None:
-                    smoothed_blobs = blobs6_array.copy()
+                # Apply smoothing to the blob points (preserve ordering)
+                if smoothed_blobs is None or smoothed_blobs.shape[0] != blobs_array.shape[0]:
+                    smoothed_blobs = blobs_array.copy()
                 else:
-                    smoothed_blobs = (1 - point_smooth_alpha) * smoothed_blobs + point_smooth_alpha * blobs6_array
+                    smoothed_blobs = (1 - point_smooth_alpha) * smoothed_blobs + point_smooth_alpha * blobs_array
 
-                # Draw smoothed midpoints in a different color to show smoothing effect
-                for smp in smoothed_midpoints:
-                    cv2.circle(disp, tuple(smp.astype(int)), 4, (0, 255, 255), -1)  # Yellow filled circle for smoothed
-
-                # For pose estimation, use the full 6 points (smoothed if available)
-                img_pts_6 = smoothed_blobs.copy()
+                # For downstream use/drawing, provide smoothed image points for the available pairs
+                img_pts = smoothed_blobs.copy()
                 points_found = True
             else:
                 points_found = False
@@ -407,251 +353,74 @@ def main():
             smoothed_midpoints = None  # Reset smoothing when not enough points
             smoothed_blobs = None
 
-        normal = None
-        inc = None
-        azi = None
-
-        if 'img_pts_6' in locals() and img_pts_6 is not None:
-            # We now try to use all 6 detected blobs (two per model center) for pose.
-            # For each model center we estimate the physical pair separation from pixel separation and working distance,
-            # then build the 6 object points (center +/- half_sep along the local tangent) and try all mappings
-            # from the detected pairs to the model centers as well as the two internal orderings per pair.
-            best = None
-            best_err_local = 1e9
-            best_perm = None
-
-            # Compute pair separations in meters using simple pinhole approximation
-            fx = K[0, 0]
-            # pair_pixel_seps were computed when pairs were built; recompute here for safety
-            pair_pixel_seps = []
-            for idx in range(3):
-                pA = img_pts_6[2 * idx]
-                pB = img_pts_6[2 * idx + 1]
-                pair_pixel_seps.append(np.linalg.norm(pA - pB))
-
-            pair_seps_m = [ (px * args.working_distance_m) / fx for px in pair_pixel_seps ]
-
-            # Build candidate object points for each model center: two points offset along the tangent
-            obj_pts_pairs = []  # list of (pt_plus, pt_minus) for each center
-            for k, t in enumerate(thetas):
-                center = obj_pts_3[k]
-                # tangent unit vector in model plane (CCW around +Z)
-                tan = np.array([-np.sin(t), np.cos(t), 0.0], dtype=np.float64)
-                half = pair_seps_m[k] / 2.0
-                obj_plus = center + half * tan
-                obj_minus = center - half * tan
-                obj_pts_pairs.append((obj_plus, obj_minus))
-
-            # Try permutations mapping detected pair indices to model center indices
-            for perm in itertools.permutations(range(3)):
-                # For each of the 3 pairs, each has two possible internal orderings (which blob maps to + vs -)
-                for order_bits in range(8):
-                    obj6 = []
-                    img6 = []
-                    valid = True
-                    for model_idx in range(3):
-                        pair_idx = perm[model_idx]
-                        # image points for this pair in the same order they were stored (2*pair_idx, 2*pair_idx+1)
-                        im_a = img_pts_6[2 * pair_idx]
-                        im_b = img_pts_6[2 * pair_idx + 1]
-                        # choose assignment based on bit
-                        bit = (order_bits >> model_idx) & 1
-                        if bit == 0:
-                            obj_a = obj_pts_pairs[model_idx][0]
-                            obj_b = obj_pts_pairs[model_idx][1]
-                            img_a = im_a
-                            img_b = im_b
-                        else:
-                            obj_a = obj_pts_pairs[model_idx][1]
-                            obj_b = obj_pts_pairs[model_idx][0]
-                            img_a = im_a
-                            img_b = im_b
-
-                        obj6.append(obj_a)
-                        obj6.append(obj_b)
-                        img6.append(img_a)
-                        img6.append(img_b)
-
-                    obj6 = np.array(obj6, dtype=np.float64)
-                    img6 = np.array(img6, dtype=np.float64)
-
-                    hyp = solve_p3p_best(obj6, img6, K, dist)
-                    if hyp is None:
-                        if args.debug:
-                            print(f"P6P failed for perm {perm} order {order_bits}")
-                        continue
-                    rvec, tvec, err = hyp
-
-                    # refine
-                    rvec, tvec = refine_pose(obj6.astype(np.float32), img6.astype(np.float32), K, dist, rvec, tvec)
-
-                    proj, _ = cv2.projectPoints(obj6, rvec, tvec, K, dist)
-                    err_ref = np.mean(np.linalg.norm(proj.reshape(-1, 2) - img6, axis=1))
-
-                    if err_ref < best_err_local:
-                        best = (rvec, tvec)
-                        best_err_local = err_ref
-                        best_perm = (perm, order_bits)
-
-            if best is not None:
-                # Update outer best_err with the successful solution
-                best_err = best_err_local
-                rvec, tvec = best
-                n = normal_from_rvec(rvec)
-
-                # Make normal face the camera (optional convention)
-                cam_to_plate = -tvec.reshape(-1)
-                if np.dot(n, cam_to_plate) < 0:
-                    n *= -1
-
-                # Smooth: combine an EMA (short-term smoothing) with a moving-average over recent EMA values
-                if normal_ema is None:
-                    normal_ema = n.copy()
-                else:
-                    normal_ema = (1 - alpha) * normal_ema + alpha * n
-                # normalize EMA
-                try:
-                    normal_ema /= np.linalg.norm(normal_ema)
-                except Exception:
-                    pass
-
-                # append EMA to buffer and compute moving-average
-                normals_buffer.append(normal_ema.copy())
-                na = np.array(normals_buffer)
-                normal_ma = np.mean(na, axis=0)
-                # normalize final smoothed normal
-                norm = np.linalg.norm(normal_ma)
-                if norm > 1e-8:
-                    normal_smoothed = normal_ma / norm
-                else:
-                    normal_smoothed = normal_ma
-
-                # Angles
-                inc = acos(np.clip(normal_smoothed[2], -1.0, 1.0))          # radians
-                azi = atan2(normal_smoothed[1], normal_smoothed[0])         # radians
-
-                # ----- Overlay: projected plate and axes -----
-                try:
-                    # Project a sampled circle (plate rim) into the image and draw a translucent fill
-                    circ_pts_3d = np.array([[model_radius * np.cos(tt), model_radius * np.sin(tt), 0.0]
-                                            for tt in np.linspace(0, 2 * np.pi, 48, endpoint=False)], dtype=np.float64)
-                    proj_circ, _ = cv2.projectPoints(circ_pts_3d, rvec, tvec, K, dist)
-                    proj_circ_pts = proj_circ.reshape(-1, 2).astype(int)
-
-                    overlay = disp.copy()
-                    # fill the projected plate region with a translucent color (orange)
-                    cv2.fillPoly(overlay, [proj_circ_pts], color=(0, 128, 255))
-                    cv2.addWeighted(overlay, 0.15, disp, 0.85, 0, disp)
-
-                    # Draw plate rim outline
-                    cv2.polylines(disp, [proj_circ_pts], isClosed=True, color=(0, 128, 255), thickness=2)
-
-                    # Draw coordinate axes at the plate center (origin = [0,0,0] in model frame)
-                    axis_len = max(0.05, model_radius * 0.5)  # meters
-                    axes3d = np.array([[0.0, 0.0, 0.0],
-                                       [axis_len, 0.0, 0.0],
-                                       [0.0, axis_len, 0.0],
-                                       [0.0, 0.0, axis_len]], dtype=np.float64)
-                    proj_axes, _ = cv2.projectPoints(axes3d, rvec, tvec, K, dist)
-                    pa = proj_axes.reshape(-1, 2)
-                    origin_px = tuple(pa[0].astype(int))
-                    x_px = tuple(pa[1].astype(int))
-                    y_px = tuple(pa[2].astype(int))
-                    z_px = tuple(pa[3].astype(int))
-
-                    # X = red, Y = green, Z = blue
-                    cv2.line(disp, origin_px, x_px, (0, 0, 255), 2)
-                    cv2.line(disp, origin_px, y_px, (0, 255, 0), 2)
-                    cv2.line(disp, origin_px, z_px, (255, 0, 0), 2)
-                    # small circles at endpoints
-                    cv2.circle(disp, x_px, 4, (0, 0, 255), -1)
-                    cv2.circle(disp, y_px, 4, (0, 255, 0), -1)
-                    cv2.circle(disp, z_px, 4, (255, 0, 0), -1)
-                except Exception:
-                    # If projection fails for any reason, continue without overlays
-                    pass
-
-                # HUD
-                cv2.putText(disp, f"Reproj err: {best_err:.3f}px", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(disp, f"Normal: [{normal_smoothed[0]:+.3f}, {normal_smoothed[1]:+.3f}, {normal_smoothed[2]:+.3f}]",
-                            (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(disp, f"Inclination: {degrees(inc):.2f} deg  Azimuth: {degrees(azi):.2f} deg",
-                            (12, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                if best_perm is not None:
-                    cv2.putText(disp, f"Pairing perm: {best_perm}", (12, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
-
-                # Machine-friendly stream (one line per frame)
-                if args.json:
-                    out = {
-                        "normal_cam": [float(normal_smoothed[0]), float(normal_smoothed[1]), float(normal_smoothed[2])],
-                        "inclination_deg": float(degrees(inc)),
-                        "azimuth_deg": float(degrees(azi)),
-                        "reproj_err_px": float(best_err)
-                    }
-                    print(json.dumps(out), flush=True)
-            else:
-                # Points detected but pose estimation failed - show debug info
-                cv2.putText(disp, "Pose estimation failed - check calibration", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(disp, f"Found {len(pairs)} pairs but P3P solving failed", (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                # Reset best_err to None when no solution found
-                best_err = None
-                if args.debug:
-                    print("--- DEBUG: Pose estimation failed ---")
-                    print("obj_pts_3=\n", obj_pts_3)
-                    # Print the 6 image points used for PnP
-                    try:
-                        print("img_pts_6=\n", img_pts_6)
-                    except Exception:
-                        print("img_pts_6 not available")
-                    print("pairs=", pairs)
-                    try:
-                        # compute midpoints from the 6 image points and show their pairwise distances
-                        mid_from_img = np.array([0.5 * (img_pts_6[2 * k] + img_pts_6[2 * k + 1]) for k in range(3)])
-                        Dimg = np.linalg.norm(mid_from_img[:, None, :] - mid_from_img[None, :, :], axis=2)
-                        print("Image midpoints distance matrix:\n", Dimg)
-                    except Exception:
-                        pass
-                    # Try fallback: use solvePnPGeneric on the 3 model centers and measured midpoints
-                    try:
-                        obj3_f = obj_pts_3.astype(np.float32)
-                        img3_f = np.array([0.5 * (img_pts_6[2 * k] + img_pts_6[2 * k + 1]) for k in range(3)]).astype(np.float32)
-                        K_f = K.astype(np.float64)
-                        dist_f = dist.astype(np.float64)
-                        ok, rvecs_out, tvecs_out, inliers = cv2.solvePnPGeneric(obj3_f, img3_f, K_f, dist_f, flags=cv2.SOLVEPNP_P3P)
-                        print("solvePnPGeneric (P3P) ok:", ok)
-                        if ok:
-                            for idx, (rv, tv) in enumerate(zip(rvecs_out, tvecs_out)):
-                                proj, _ = cv2.projectPoints(obj_pts_3.astype(np.float32), rv, tv, K_f, dist_f)
-                                err = np.mean(np.linalg.norm(proj.reshape(-1, 2) - img3_f, axis=1))
-                                print(f"  Solution {idx}: reproj err = {err}")
-                        else:
-                            print("  solvePnPGeneric did not return solutions")
-                    except Exception as e:
-                        print("  Fallback solvePnPGeneric exception:", e)
+        # If we have any paired image points, compute and display pair separations and keep smoothed blobs
+        if 'img_pts' in locals() and img_pts is not None:
+            # compute pixel separations between paired blobs (pairs may be 1..3)
+            num_pairs = len(pairs)
+            pair_pixel_seps = [np.linalg.norm(img_pts[2 * k] - img_pts[2 * k + 1]) for k in range(num_pairs)]
+            for k, sep in enumerate(pair_pixel_seps):
+                cv2.putText(disp, f"Pair{k} sep: {sep:.1f}px", (12, 120 + 18 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            points_found = True
         else:
             # Points not found - show waiting message
-            if len(pts) < 6:
-                status_msg = f"Waiting for points... Found {len(pts)}/6 blobs"
+            if len(pts) < 2:
+                status_msg = f"Waiting for points... Found {len(pts)} blobs"
             else:
-                status_msg = f"Waiting for valid pairs... Found {len(pts)} blobs but {len(pairs)}/3 pairs"
+                status_msg = f"Waiting for valid pairs... Found {len(pts)} blobs and {len(pairs)} pairs"
             cv2.putText(disp, status_msg, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
             cv2.putText(disp, "Keep camera view steady", (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
         # Basic overlay counts
         cv2.putText(disp, f"Blobs: {len(pts)}", (12, disp.shape[0] - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        cv2.imshow("plane normal (live)", disp)
+        # Draw cursor position if available
+        if cursor_pt is not None:
+            cx, cy = int(cursor_pt[0]), int(cursor_pt[1])
+            cv2.drawMarker(disp, (cx, cy), (200, 200, 200), markerType=cv2.MARKER_CROSS, markerSize=12, thickness=1)
+            cv2.putText(disp, f"cursor: ({cx},{cy})", (cx + 10, cy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # Draw motor highlights and labels for assigned blobs (persist across frames)
+        if motor_assignments:
+            for mname, stored in motor_assignments.items():
+                # if we have current detected points, try to find the closest one to the stored coordinate
+                label_pos = None
+                if (img_pts is not None) and (len(img_pts) > 0):
+                    d = np.linalg.norm(img_pts - stored.reshape((1, 2)), axis=1)
+                    j = int(np.argmin(d))
+                    label_pos = img_pts[j]
+                else:
+                    label_pos = stored
+                lx, ly = int(label_pos[0]), int(label_pos[1])
+                color = motor_colors.get(mname, (0, 255, 255))
+                # draw filled circle to highlight the assigned blob
+                cv2.circle(disp, (lx, ly), 10, color, -1)
+                # draw a thin black outline for contrast
+                cv2.circle(disp, (lx, ly), 12, (0, 0, 0), 2)
+                # draw the label slightly offset
+                tx, ty = lx + 12, ly - 12
+                # black shadow for readability
+                cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+                cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow(win_name, disp)
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
             break
-        if key == ord('n') and normal_smoothed is not None and inc is not None and azi is not None and best_err is not None:
-            print("---- Normal / Angles ----")
-            print("normal (camera):", normal_smoothed)
-            print("inclination (deg):", degrees(inc))
-            print("azimuth (deg):    ", degrees(azi))
-            print("reproj err (px):  ", best_err)
-        elif key == ord('n'):
-            print("Waiting for points to be detected before normal can be calculated.")
+        if key == ord('n'):
+            # Compute and print pair separations on-demand for the current frame (no persistent storage)
+            if 'img_pts' in locals() and img_pts is not None:
+                num_pairs = len(pairs)
+                pair_pixel_seps = [np.linalg.norm(img_pts[2 * k] - img_pts[2 * k + 1]) for k in range(num_pairs)]
+                print("---- Pair separations (px) ----")
+                for idx, s in enumerate(pair_pixel_seps):
+                    print(f"Pair {idx}: {s:.2f} px")
+            else:
+                print("No pairs detected to print separations.")
+        if key == ord('r'):
+            # reset motor assignments
+            motor_assignments.clear()
+            next_motor_idx = 0
+            print("Motor assignments reset.")
 
     cap.release()
     cv2.destroyAllWindows()
