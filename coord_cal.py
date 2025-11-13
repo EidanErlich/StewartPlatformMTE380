@@ -17,6 +17,17 @@ POINT_SMOOTH_ALPHA = 0.3       # point smoothing factor (0-1)
 PAIR_SEP_M = None              # known physical separation (meters) between two screws in a pair
 PAIR_SEP_TOL = 0.4             # tolerance fraction for PAIR_SEP_M when filtering pairs
 
+# Coordinate frame storage (updated when motors stabilized)
+coordinate_frame = None
+
+"""
+FOR HUMAN
+
+Motor A - Connection 0
+Motor B - Connection 2
+Motor C - Connection 4
+"""
+
 
 def estimate_pixel_area_for_size(physical_diameter_m, K, working_distance_m=0.5):
     """
@@ -199,39 +210,63 @@ def main():
     motor_order = ['A', 'B', 'C']
     next_motor_idx = 0
     cursor_pt = None
+    # Latest detected midpoints and pairs (used by mouse callback)
+    latest_pts = np.empty((0, 2), dtype=np.float32)
+    latest_pairs = []
+    # Per-motor smoothed midpoints (EMA in image pixels) and stability tracking
+    motor_smoothed = {'A': None, 'B': None, 'C': None}
+    motor_last_moved = {'A': None, 'B': None, 'C': None}
+    motor_stable_since = {'A': None, 'B': None, 'C': None}
+    motors_stable_flag = False
+    # stability parameters
+    STABLE_PIXEL_THRESH = 5   # px movement threshold
+    STABLE_TIME_SEC = 1.0       # duration to consider stable
+    smoothing_alpha = POINT_SMOOTH_ALPHA
     # Colors for motor highlights (B, G, R)
     motor_colors = {'A': (0, 0, 255), 'B': (255, 0, 0), 'C': (0, 255, 0)}
 
     # Mouse callback to track cursor and assign motors on left-click
     def on_mouse(event, x, y, flags, param):
         nonlocal cursor_pt, motor_assignments, next_motor_idx
+        nonlocal latest_pts, latest_pairs
         if event == cv2.EVENT_MOUSEMOVE:
             cursor_pt = np.array([float(x), float(y)], dtype=np.float32)
         elif event == cv2.EVENT_LBUTTONDOWN:
-            # Safely check for detected points in this scope
-            if 'pts' not in locals() or pts is None or len(pts) == 0:
-                print("No detected blobs to assign.")
+            # Use latest detected midpoint pairs to select a pair nearest to the click
+            if latest_pts is None or latest_pts.size == 0 or len(latest_pairs) == 0:
+                print("No detected pairs to assign. Wait until the detector finds pairs.")
                 return
             click = np.array([float(x), float(y)], dtype=np.float32)
-            # find nearest detected blob
-            dists = np.linalg.norm(pts - click, axis=1)
+            # compute distances to midpoints (latest_pts are the smoothed blob points (pairs ordered))
+            # midpoints are every two entries (0/1 -> pair0 midpoint at index 0.5). We'll build midpoints list
+            midpoints = []
+            for (a, b) in latest_pairs:
+                p = 0.5 * (latest_pts[a] + latest_pts[b])
+                midpoints.append(p)
+            midpoints = np.array(midpoints, dtype=np.float32)
+            dists = np.linalg.norm(midpoints - click, axis=1)
             idx = int(np.argmin(dists))
             min_dist = float(dists[idx])
-            # threshold: ignore clicks that are clearly far from blobs
-            if min_dist > 50.0:
-                print(f"Click too far from nearest blob ({min_dist:.1f}px); ignore.")
+            if min_dist > 80.0:
+                print(f"Click too far from nearest pair midpoint ({min_dist:.1f}px); ignore.")
                 return
-            candidate = pts[idx]
-            # check if this blob (or a blob very near it) is already assigned
+            # compute midpoint and candidate point
+            a, b = latest_pairs[idx]
+            candidate = 0.5 * (latest_pts[a] + latest_pts[b])
+            # check if this midpoint (or a midpoint very near it) is already assigned
             for k, v in motor_assignments.items():
-                if np.linalg.norm(v - candidate) < 8.0:
-                    print(f"Blob already assigned to motor {k}")
+                if np.linalg.norm(v - candidate) < 12.0:
+                    print(f"Midpoint already assigned to motor {k}")
                     return
             if next_motor_idx >= len(motor_order):
                 print("All motors already assigned. Press 'r' to reset assignments.")
                 return
             name = motor_order[next_motor_idx]
             motor_assignments[name] = candidate.copy()
+            # initialize smoothing state for this motor
+            motor_smoothed[name] = candidate.copy()
+            motor_last_moved[name] = cv2.getTickCount() / cv2.getTickFrequency()
+            motor_stable_since[name] = None
             next_motor_idx += 1
             print(f"Assigned motor {name} to blob at {candidate}")
 
@@ -353,6 +388,117 @@ def main():
             smoothed_midpoints = None  # Reset smoothing when not enough points
             smoothed_blobs = None
 
+        # update latest detected points and pairs for mouse selection
+        if 'pts' in locals() and pts is not None:
+            latest_pts = pts.copy()
+        else:
+            latest_pts = np.empty((0, 2), dtype=np.float32)
+        latest_pairs = pairs if 'pairs' in locals() else []
+
+        # ---- Motor smoothing and stability detection ----
+        t_now = cv2.getTickCount() / cv2.getTickFrequency()
+        # Update each assigned motor by finding the closest midpoint in img_pts (if available)
+        if 'img_pts' in locals() and img_pts is not None and len(img_pts) > 0:
+            num_pairs = len(pairs)
+            # construct midpoints from img_pts: each pair corresponds to two consecutive entries
+            midpts = []
+            for k in range(num_pairs):
+                m = 0.5 * (img_pts[2 * k] + img_pts[2 * k + 1])
+                midpts.append(m)
+            midpts = np.array(midpts, dtype=np.float32)
+        else:
+            midpts = None
+
+        # For each motor, update smoothing if we can find a corresponding midpoint
+        for mname in motor_order:
+            if mname not in motor_assignments:
+                continue
+            stored = motor_assignments[mname]
+            found_pt = None
+            if midpts is not None and midpts.size > 0:
+                d = np.linalg.norm(midpts - stored.reshape((1, 2)), axis=1)
+                j = int(np.argmin(d))
+                if d[j] < 100.0:
+                    found_pt = midpts[j]
+            if found_pt is None:
+                # fallback to stored assignment (no update)
+                curr = stored.copy()
+            else:
+                curr = found_pt
+
+            prev = motor_smoothed.get(mname)
+            if prev is None:
+                motor_smoothed[mname] = curr.copy()
+                motor_last_moved[mname] = t_now
+                motor_stable_since[mname] = None
+            else:
+                motor_smoothed[mname] = (1 - smoothing_alpha) * prev + smoothing_alpha * curr
+                # movement since previous smoothed
+                mv = np.linalg.norm(motor_smoothed[mname] - prev)
+                if mv > STABLE_PIXEL_THRESH:
+                    motor_last_moved[mname] = t_now
+                    motor_stable_since[mname] = None
+                else:
+                    # if stable and not yet marked, set stable_since
+                    if motor_stable_since[mname] is None:
+                        motor_stable_since[mname] = t_now
+
+        # Check if all motors are assigned and stable for required duration
+        motors_assigned = all([m in motor_assignments for m in motor_order])
+        motors_stable_flag = False
+        if motors_assigned:
+            all_stable = True
+            for m in motor_order:
+                ss = motor_stable_since.get(m)
+                if ss is None or (t_now - ss) < STABLE_TIME_SEC:
+                    all_stable = False
+                    break
+            if all_stable:
+                motors_stable_flag = True
+        # If stable and coordinate_frame not stored yet, compute it
+        global coordinate_frame
+        if motors_stable_flag and coordinate_frame is None:
+            # Backproject smoothed image points to approximate 3D using WORKING_DISTANCE_M
+            fx = K[0, 0]
+            fy = K[1, 1] if K.shape[0] > 1 else K[0, 0]
+            cx = K[0, 2]
+            cy = K[1, 2]
+            Z = WORKING_DISTANCE_M
+            pos3 = {}
+            for m in motor_order:
+                img = motor_smoothed[m]
+                x = (img[0] - cx) * Z / fx
+                y = (img[1] - cy) * Z / fy
+                z = Z
+                pos3[m] = np.array([x, y, z], dtype=np.float64)
+
+            # centroid origin
+            origin = (pos3['A'] + pos3['B'] + pos3['C']) / 3.0
+            # X axis toward Motor A from origin
+            x_axis = pos3['A'] - origin
+            x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-12)
+            # provisional vector towards B, remove component along X to get Y in-plane
+            v = pos3['B'] - origin
+            v = v - np.dot(v, x_axis) * x_axis
+            y_axis = v / (np.linalg.norm(v) + 1e-12)
+            # Z is perpendicular to plane
+            z_axis = np.cross(x_axis, y_axis)
+            z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+            # ensure z_axis points toward the camera (camera at origin); flip if needed
+            to_cam = -origin
+            if np.dot(z_axis, to_cam) < 0:
+                z_axis = -z_axis
+
+            coordinate_frame = {
+                'origin_m': origin.tolist(),
+                'x_axis': x_axis.tolist(),
+                'y_axis': y_axis.tolist(),
+                'z_axis': z_axis.tolist(),
+                'timestamp': float(t_now)
+            }
+            print("Coordinate system stored:")
+            print(coordinate_frame)
+
         # If we have any paired image points, compute and display pair separations and keep smoothed blobs
         if 'img_pts' in locals() and img_pts is not None:
             # compute pixel separations between paired blobs (pairs may be 1..3)
@@ -382,14 +528,16 @@ def main():
         # Draw motor highlights and labels for assigned blobs (persist across frames)
         if motor_assignments:
             for mname, stored in motor_assignments.items():
-                # if we have current detected points, try to find the closest one to the stored coordinate
-                label_pos = None
-                if (img_pts is not None) and (len(img_pts) > 0):
-                    d = np.linalg.norm(img_pts - stored.reshape((1, 2)), axis=1)
-                    j = int(np.argmin(d))
-                    label_pos = img_pts[j]
-                else:
-                    label_pos = stored
+                # prefer smoothed motor positions for label placement
+                label_pos = motor_smoothed.get(mname)
+                if label_pos is None:
+                    # fallback to stored coordinate or nearest img pt
+                    if (img_pts is not None) and (len(img_pts) > 0):
+                        d = np.linalg.norm(img_pts - stored.reshape((1, 2)), axis=1)
+                        j = int(np.argmin(d))
+                        label_pos = img_pts[j]
+                    else:
+                        label_pos = stored
                 lx, ly = int(label_pos[0]), int(label_pos[1])
                 color = motor_colors.get(mname, (0, 255, 255))
                 # draw filled circle to highlight the assigned blob
@@ -401,6 +549,46 @@ def main():
                 # black shadow for readability
                 cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
                 cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        # If coordinate frame available, draw X/Y/Z arrows projected into image
+        if coordinate_frame is not None:
+            # small helper to project camera-frame 3D point to image pixel
+            def project_pt(pt_cam):
+                Xc = pt_cam[0]
+                Yc = pt_cam[1]
+                Zc = pt_cam[2]
+                if Zc == 0:
+                    Zc = 1e-6
+                u = (K[0, 0] * Xc) / Zc + K[0, 2]
+                v = (K[1, 1] * Yc) / Zc + K[1, 2]
+                return int(round(u)), int(round(v))
+
+            origin = np.array(coordinate_frame['origin_m'], dtype=np.float64)
+            x_axis = np.array(coordinate_frame['x_axis'], dtype=np.float64)
+            y_axis = np.array(coordinate_frame['y_axis'], dtype=np.float64)
+            z_axis = np.array(coordinate_frame['z_axis'], dtype=np.float64)
+            # Choose axis length in meters for visualization
+            axis_len_m = 0.1
+            p_o = origin
+            p_x = origin + x_axis * axis_len_m
+            p_y = origin + y_axis * axis_len_m
+            p_z = origin + z_axis * axis_len_m
+            try:
+                uo, vo = project_pt(p_o)
+                ux, vx = project_pt(p_x)
+                uy, vy = project_pt(p_y)
+                uz, vz = project_pt(p_z)
+                # draw axes: X=red, Y=green, Z=blue
+                cv2.arrowedLine(disp, (uo, vo), (ux, vx), (0, 0, 255), 3, tipLength=0.05)
+                cv2.putText(disp, 'X', (ux + 4, vx + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.arrowedLine(disp, (uo, vo), (uy, vy), (0, 255, 0), 3, tipLength=0.05)
+                cv2.putText(disp, 'Y', (uy + 4, vy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.arrowedLine(disp, (uo, vo), (uz, vz), (255, 0, 0), 3, tipLength=0.05)
+                cv2.putText(disp, 'Z', (uz + 4, vz + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(disp, 'Coordinate system stored', (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            except Exception:
+                # projection failed for degenerate values; skip drawing
+                pass
 
         cv2.imshow(win_name, disp)
         key = cv2.waitKey(1) & 0xFF
@@ -420,7 +608,14 @@ def main():
             # reset motor assignments
             motor_assignments.clear()
             next_motor_idx = 0
-            print("Motor assignments reset.")
+            # reset smoothing/stability and coordinate frame
+            for m in motor_smoothed.keys():
+                motor_smoothed[m] = None
+                motor_last_moved[m] = None
+                motor_stable_since[m] = None
+            motors_stable_flag = False
+            coordinate_frame = None
+            print("Motor assignments and coordinate frame reset. Re-select motors.")
 
     cap.release()
     cv2.destroyAllWindows()

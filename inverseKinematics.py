@@ -12,9 +12,7 @@ BASE_RADIUS = 5.0        # br, radius of the base circle
 # Per-servo zero-angle calibration offsets (in degrees).
 # Positive values mean the physical "zero" sits at +offset degrees and you must add the offset
 # to the computed angle before commanding the servo. Tune these per motor.
-SERVO_ZERO_OFFSETS_DEG = np.array([17.0, 21.0, 17.0])
-
-
+SERVO_ZERO_OFFSETS_DEG = np.full(3, 15.5)
 
 class StewartPlatform:
 	def __init__(self):
@@ -30,19 +28,35 @@ class StewartPlatform:
 		# Copy of zero-angle offsets (deg) used to bias command outputs
 		self.servo_zero_offsets_deg = SERVO_ZERO_OFFSETS_DEG.copy()
 
-	def _calculate_circle_points(self, radius, num_points, z=0):
-		angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
+	def _calculate_circle_points(self, radius, num_points, z=0, start_angle=0.0, ccw=True):
+		"""
+		Return points evenly spaced on a circle in the XY plane.
+
+		Args:
+			radius: circle radius
+			num_points: number of points
+			z: z coordinate for all points
+			start_angle: angle (radians) of the first point measured from +X axis
+			ccw: if True angles increase counter-clockwise (positive rotation),
+			     otherwise they increase clockwise.
+
+		This makes the coordinate convention explicit: start_angle=0 aligns the
+		first motor with +X, and ccw=True means sweeping from +X towards +Y will
+		reach the second motor (motor 1) in the positive rotation direction.
+		"""
+		sign = 1.0 if ccw else -1.0
+		angles = start_angle + sign * np.linspace(0, 2 * np.pi, num_points, endpoint=False)
 		return np.array([
 			[radius * np.cos(a), radius * np.sin(a), z] for a in angles
 		])
 
 	def _calculate_servo_betas(self, num_servos):
-		betas = []
-		for k in range(3):
-			base_angle = 2 * np.pi * k / 3  # 0°, 120°, 240°
-			beta_k = base_angle              # Outward radial direction
-			betas.append(beta_k)
-		return np.array(betas)
+		# Derive servo beta angles from the base anchor points so the betas
+		# always match the actual base point geometry and the chosen start_angle/ccw.
+		# beta_k is the outward radial direction angle measured from +X.
+		xy = self.base_points[:, :2]
+		betas = np.arctan2(xy[:,1], xy[:,0])
+		return betas
 	
 	def _calculate_neutral_height(self):
 		# Calculate optimal height where horn and rod are orthogonal (90 degrees)
