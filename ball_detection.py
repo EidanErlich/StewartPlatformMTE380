@@ -96,18 +96,6 @@ class BallDetector:
 
         return overlay, found, (x_m, y_m)
 
-# --- Legacy 1D compatibility ---
-def detect_ball_x(frame):
-    """Legacy function: keeps original x-only interface."""
-    detector = BallDetector()
-    vis_frame, found, (x_m, _) = detector.draw_detection(frame)
-    if found:
-        x_norm = x_m / detector.scale_factor if detector.scale_factor else 0.0
-        x_norm = np.clip(x_norm, -1.0, 1.0)
-    else:
-        x_norm = 0.0
-    return found, x_norm, vis_frame
-
 # --- Testing utility ---
 def main():
     detector = BallDetector()
