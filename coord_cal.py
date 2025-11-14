@@ -45,6 +45,184 @@ def estimate_pixel_area_for_size(physical_diameter_m, K, working_distance_m=0.5)
     return pixel_area
 
 
+def load_camera_calib(calib_path="camera_calib.npz"):
+    """Load camera intrinsics from an npz file."""
+    data = np.load(calib_path, allow_pickle=True)
+    K = data["K"].astype(np.float64)
+    dist = data["dist"].astype(np.float64)
+    return K, dist
+
+
+def detect_pairs_from_frame(frame, K, detector=None, point_diameter_m=POINT_DIAMETER_M,
+                            working_distance_m=WORKING_DISTANCE_M, max_pair_px=MAX_PAIR_PX):
+    """
+    Detect dark circular blobs in the given frame and return paired blob points.
+    Returns a tuple (img_pts, pairs) where img_pts is an (2*N,2) array containing
+    the two blob points per pair in the same order as pairs, and pairs is a list of
+    index tuples into the original pts array indicating the paired points.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    if detector is None:
+        # estimate reasonable area range from camera intrinsics and expected size
+        est_area = estimate_pixel_area_for_size(point_diameter_m, K, working_distance_m)
+        min_area = int(max(5, est_area * 0.3))
+        max_area = int(max(20, est_area * 2.0))
+        detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
+
+    keypoints = detector.detect(blurred)
+
+    # Filter keypoints by approximate diameter derived from K and working distance
+    fx = K[0, 0]
+    expected_diameter_px = (point_diameter_m * fx) / working_distance_m
+    min_diameter_px = expected_diameter_px * 0.5
+    max_diameter_px = expected_diameter_px * 1.5
+
+    filtered_keypoints = []
+    for kp in keypoints:
+        if min_diameter_px <= kp.size <= max_diameter_px:
+            filtered_keypoints.append(kp)
+    keypoints = filtered_keypoints
+
+    if keypoints:
+        refined_pts = [refine_centroid_subpixel(gray, kp.pt, win=11) for kp in keypoints]
+        pts = np.array(refined_pts, dtype=np.float32)
+    else:
+        pts = np.empty((0, 2), dtype=np.float32)
+
+    pairs = []
+    img_pts = None
+    if len(pts) >= 2:
+        candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=max_pair_px)
+        if candidate_pairs:
+            used_idx = set()
+            for a, b in candidate_pairs:
+                used_idx.add(int(a))
+                used_idx.add(int(b))
+            keep_indices = sorted(used_idx)
+            # rebuild pts to only include paired points and produce ordered img_pts where each pair's two points are consecutive
+            new_pts = []
+            pairs = []
+            for (a, b) in candidate_pairs:
+                pairs.append((int(a), int(b)))
+                new_pts.append(pts[int(a)])
+                new_pts.append(pts[int(b)])
+            img_pts = np.array(new_pts, dtype=np.float64).reshape((-1, 2))
+
+    return img_pts, pairs
+
+
+def detect_platform_circle(frame):
+    """Detect circular platform using Hough Circle Transform. Returns (x,y,r) or None."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
+                               param1=80, param2=30, minRadius=80, maxRadius=300)
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        x, y, r = circles[0][0]
+        return int(x), int(y), int(r)
+    return None
+
+
+class PairDetector:
+    """Stateful detector that maintains EMA smoothing for midpoints and blob points.
+    Use process(frame) each loop to get smoothed img_pts and pairs.
+    """
+    def __init__(self, K, point_diameter_m=POINT_DIAMETER_M, working_distance_m=WORKING_DISTANCE_M,
+                 alpha=POINT_SMOOTH_ALPHA, detector=None, max_pair_px=MAX_PAIR_PX):
+        self.K = K
+        self.point_diameter_m = point_diameter_m
+        self.working_distance_m = working_distance_m
+        self.alpha = float(alpha)
+        self.max_pair_px = max_pair_px
+        self.detector = detector
+        self.smoothed_midpoints = None
+        self.smoothed_blobs = None
+
+    def process(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # create detector lazily if needed
+        if self.detector is None:
+            if (self.K is not None) and (hasattr(self.K, 'shape') and self.K.shape[0] >= 1):
+                try:
+                    est_area = estimate_pixel_area_for_size(self.point_diameter_m, self.K, self.working_distance_m)
+                    min_area = int(max(5, est_area * 0.3))
+                    max_area = int(max(20, est_area * 2.0))
+                except Exception:
+                    min_area, max_area = 50, 500
+            else:
+                min_area, max_area = 50, 500
+            self.detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
+
+        keypoints = self.detector.detect(blurred)
+
+        # estimate expected diameter px if K provided
+        if (self.K is not None) and (hasattr(self.K, 'shape') and self.K.shape[0] >= 1):
+            fx = float(self.K[0, 0])
+            expected_diameter_px = (self.point_diameter_m * fx) / self.working_distance_m
+            min_diameter_px = expected_diameter_px * 0.5
+            max_diameter_px = expected_diameter_px * 1.5
+        else:
+            min_diameter_px = 0
+            max_diameter_px = 1e9
+
+        filtered_keypoints = []
+        for kp in keypoints:
+            if min_diameter_px <= kp.size <= max_diameter_px:
+                filtered_keypoints.append(kp)
+        keypoints = filtered_keypoints
+
+        if keypoints:
+            refined_pts = [refine_centroid_subpixel(gray, kp.pt, win=11) for kp in keypoints]
+            pts = np.array(refined_pts, dtype=np.float32)
+        else:
+            pts = np.empty((0, 2), dtype=np.float32)
+
+        pairs = []
+        img_pts = None
+        if len(pts) >= 2:
+            candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=self.max_pair_px)
+            if candidate_pairs:
+                midpts = []
+                blobs = []
+                for (a, b) in candidate_pairs:
+                    mid = 0.5 * (pts[a] + pts[b])
+                    midpts.append(mid)
+                    blobs.append(pts[a])
+                    blobs.append(pts[b])
+
+                midpts_array = np.array(midpts, dtype=np.float64)
+                blobs_array = np.array(blobs, dtype=np.float64).reshape((-1, 2))
+
+                # smoothing (EMA)
+                if self.smoothed_midpoints is None or self.smoothed_midpoints.shape[0] != midpts_array.shape[0]:
+                    self.smoothed_midpoints = midpts_array.copy()
+                else:
+                    self.smoothed_midpoints = (1 - self.alpha) * self.smoothed_midpoints + self.alpha * midpts_array
+
+                if self.smoothed_blobs is None or self.smoothed_blobs.shape[0] != blobs_array.shape[0]:
+                    self.smoothed_blobs = blobs_array.copy()
+                else:
+                    self.smoothed_blobs = (1 - self.alpha) * self.smoothed_blobs + self.alpha * blobs_array
+
+                img_pts = self.smoothed_blobs.copy()
+                pairs = [(int(a), int(b)) for a, b in candidate_pairs]
+
+        return img_pts, pairs
+
+
+def detect_pairs_from_frame(frame, K, detector=None, point_diameter_m=POINT_DIAMETER_M,
+                            working_distance_m=WORKING_DISTANCE_M, max_pair_px=MAX_PAIR_PX):
+    """Backward-compatible wrapper: single-frame detection without smoothing (alpha=1.0)."""
+    pd = PairDetector(K, point_diameter_m=point_diameter_m, working_distance_m=working_distance_m,
+                      alpha=1.0, detector=detector, max_pair_px=max_pair_px)
+    return pd.process(frame)
+
+
 def make_blob_detector(min_area=50, max_area=500, min_circ=0.5, dark=True, min_size=5, max_size=30):
     """
     Create blob detector tuned for ~1cm diameter points.
