@@ -3,23 +3,47 @@
 3D Stewart Platform PID Controller
 Real-time 2D PID control for ball balancing on a 3-motor Stewart platform.
 
-This controller:
-- Reads ball position (x, y) in meters from ball detection
+This controller integrates:
+- Ball detection (BallDetector from ball_detection.py) for real-time vision
+- PID control for X and Y axes with live tuning
+- Normal vector computation from PID outputs
+- Arduino servo control (based on arduino_controller.py)
+- Inverse kinematics (from inverseKinematics.py) for servo angle calculation
+
+Features:
+- Reads ball position (x, y) in meters from camera with calibration
 - Uses independent PID controllers for x and y axes
 - Maps PID outputs to a desired platform normal vector
 - Provides live tuning via OpenCV trackbars
 - Allows target selection via mouse clicks on camera feed
+- Sends computed servo angles to Arduino hardware
+
+Hardware Interface:
+- Connects to Arduino via serial (auto-detects port)
+- Uses StewartPlatform inverse kinematics to compute servo angles
+- Falls back to simulation mode if Arduino not connected
+
+Usage:
+    python PID_3d.py
+    
+Controls:
+    - Click on camera window to set target position
+    - Use trackbars in 'PID Tuning' window to adjust gains
+    - Press 'q' to quit, 'r' to reset PID integrals
 """
 
 import cv2
 import numpy as np
 import time
+import sys
+import serial
+import serial.tools.list_ports
 from typing import Optional, Tuple
 
+# Import ball detection and inverse kinematics
+from ball_detection import BallDetector
+from inverseKinematics import StewartPlatform
 
-# ============================================================================
-# PID Controller Class
-# ============================================================================
 
 class PIDController:
     """
@@ -119,10 +143,6 @@ class PIDController:
         self.Kd = Kd
 
 
-# ============================================================================
-# Control State Management
-# ============================================================================
-
 class ControlState:
     """Manages control state: gains, target position, and runtime parameters."""
     
@@ -131,14 +151,11 @@ class ControlState:
         self.x_target = 0.0
         self.y_target = 0.0
         
-        # PID gains for x and y axes
-        self.Kp_x = 10.0
-        self.Ki_x = 0.5
-        self.Kd_x = 2.0
-        
-        self.Kp_y = 10.0
-        self.Ki_y = 0.5
-        self.Kd_y = 2.0
+        # PID gains (same for both x and y axes)
+        # Conservative starting values for stability
+        self.Kp = 5.0   # Proportional gain
+        self.Ki = 0.1   # Integral gain (low to prevent windup)
+        self.Kd = 1.0   # Derivative gain (damping)
         
         # Control parameters
         self.control_frequency = 100.0  # Hz
@@ -154,61 +171,6 @@ class ControlState:
         self.ball_position = None  # (x, y) or None if not detected
         self.last_update_time = None
 
-
-# ============================================================================
-# Ball Tracker (Hardware Interface Stub)
-# ============================================================================
-
-class BallTracker:
-    """
-    Wrapper around ball detection hardware interface.
-    
-    This is a STUB - replace get_ball_position() with your actual ball detection code.
-    """
-    
-    def __init__(self):
-        """Initialize ball tracker."""
-        # STUB: In real implementation, initialize camera/ball detector here
-        self.detector = None  # Replace with your BallDetector instance
-        
-    def get_ball_position(self) -> Optional[Tuple[float, float]]:
-        """
-        Get current ball position in platform coordinates.
-        
-        Returns:
-            (x, y) tuple in meters, or None if ball not detected.
-            Coordinate system: (0, 0) at plate center, x right, y up.
-            
-        STUB IMPLEMENTATION:
-        Replace this with your actual ball detection code, e.g.:
-            from ball_detection import BallDetector
-            found, center, radius, (x_m, y_m) = self.detector.detect_ball(frame)
-            if found:
-                return (x_m, y_m)
-            return None
-        """
-        # STUB: Return simulated position for testing
-        # In real code, call your ball detection here
-        return (0.01, -0.02)  # Example: ball slightly right and down
-    
-    def get_camera_frame(self) -> Optional[np.ndarray]:
-        """
-        Get current camera frame for display.
-        
-        Returns:
-            BGR image array, or None if frame not available.
-            
-        STUB IMPLEMENTATION:
-        Replace with your actual camera capture code.
-        """
-        # STUB: Return None or a dummy frame
-        # In real code: ret, frame = cap.read(); return frame if ret else None
-        return None
-
-
-# ============================================================================
-# Normal Controller (PID Output → Plane Normal)
-# ============================================================================
 
 class NormalController:
     """
@@ -290,74 +252,266 @@ class NormalController:
 
 
 # ============================================================================
-# Hardware Interface Stub
+# Hardware Interface - Arduino + Servo Control
 # ============================================================================
 
-def set_desired_normal(nx: float, ny: float, nz: float):
+class ArduinoServoController:
     """
-    Set desired platform normal vector (hardware interface).
-    
-    This is a STUB - replace with your actual motor control code.
-    
-    Args:
-        nx: x-component of unit normal vector
-        ny: y-component of unit normal vector
-        nz: z-component of unit normal vector (should be positive)
-        
-    STUB IMPLEMENTATION:
-    In your real code, this should:
-    1. Convert normal vector to platform orientation (e.g., roll/pitch angles)
-    2. Use inverse kinematics to compute motor positions
-    3. Send commands to motors
-    
-    Example:
-        # Convert normal to roll/pitch
-        roll = np.arcsin(-nx)
-        pitch = np.arcsin(ny / np.cos(roll))
-        
-        # Use inverse kinematics (your code)
-        motor_angles = inverse_kinematics(roll, pitch, 0.0)
-        
-        # Send to motors
-        send_motor_commands(motor_angles)
+    Controls Stewart platform servos via Arduino serial interface.
+    Based on arduino_controller.py implementation.
     """
-    # STUB: Just log the desired normal
-    print(f"[HARDWARE] Desired normal: n=({nx:.4f}, {ny:.4f}, {nz:.4f})")
-    # TODO: Replace with actual motor control code
+    
+    def __init__(self, port=None, baud=115200):
+        """
+        Initialize Arduino servo controller.
+        
+        Args:
+            port: Serial port (auto-detected if None)
+            baud: Baud rate (default: 115200)
+        """
+        self.platform = StewartPlatform()
+        self.ser = None
+        self.connected = False
+        
+        # Find and connect to Arduino
+        if port is None:
+            port = self.find_arduino_port()
+        
+        if port:
+            self.connect(port, baud)
+        else:
+            print("[ARDUINO] No Arduino found - running in simulation mode")
+            self.connected = False
+    
+    def find_arduino_port(self):
+        """Auto-detect Arduino port."""
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            # Look for common Arduino USB identifiers
+            if 'usbmodem' in p.device or 'usbserial' in p.device or 'Arduino' in str(p.description):
+                print(f"[ARDUINO] Found Arduino on: {p.device}")
+                return p.device
+        return None
+    
+    def connect(self, port, baud):
+        """Connect to Arduino via serial."""
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            time.sleep(2)  # Wait for Arduino to reset
+            
+            # Read startup messages
+            while self.ser.in_waiting:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                print(f"[ARDUINO] {line}")
+            
+            print(f"[ARDUINO] Connected to Arduino on {port} at {baud} baud")
+            print("[ARDUINO] Initializing all servos to 0 degrees...")
+            # Send all servos to 0 degrees directly
+            self.send_angles([0, 0, 0])
+            print("[ARDUINO] Servos initialized: [0°, 0°, 0°]")
+            self.connected = True
+            
+        except serial.SerialException as e:
+            print(f"[ARDUINO] Failed to connect to {port}: {e}")
+            print("[ARDUINO] Running in simulation mode")
+            self.connected = False
+    
+    def send_angles(self, angles_deg):
+        """Send servo angles to Arduino in degrees."""
+        if self.ser and self.ser.is_open:
+            # Format: "angle0,angle1,angle2\n"
+            command = f"{int(angles_deg[0])},{int(angles_deg[1])},{int(angles_deg[2])}\n"
+            self.ser.write(command.encode())
+            
+            # Read response
+            time.sleep(0.01)  # Small delay for Arduino to respond
+            if self.ser.in_waiting:
+                response = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if response.startswith('OK:'):
+                    return True
+                elif response.startswith('ERR:'):
+                    print(f"[ARDUINO] Error: {response}")
+                    return False
+        return False
+    
+    def set_normal(self, nx: float, ny: float, nz: float):
+        """
+        Set platform normal vector and compute/send servo angles.
+        
+        Args:
+            nx: x-component of unit normal vector
+            ny: y-component of unit normal vector
+            nz: z-component of unit normal vector (should be positive)
+        """
+        normal = np.array([nx, ny, nz], dtype=float)
+        
+        # Calculate servo command angles (deg) with zero offsets and clamp to 0..65
+        angles_deg = self.platform.calculate_servo_angles(
+            normal,
+            degrees=True,
+            apply_offsets=True,
+            clamp_min=0.0,
+            clamp_max=65.0,
+        )
+        
+        if self.connected:
+            # Send to Arduino
+            self.send_angles(angles_deg)
+        
+        # Log for debugging
+        # print(f"[SERVO] Normal: [{nx:.3f}, {ny:.3f}, {nz:.3f}] | "
+        #       f"Angles: [{angles_deg[0]:.1f}°, {angles_deg[1]:.1f}°, {angles_deg[2]:.1f}°]")
+        
+        return angles_deg
+    
+    def close(self):
+        """Close serial connection."""
+        if self.ser and self.ser.is_open:
+            # Reset to neutral before closing
+            self.set_normal(0.0, 0.0, 1.0)
+            time.sleep(0.1)
+            self.ser.close()
+            print("[ARDUINO] Serial connection closed")
 
 
 # ============================================================================
-# UI Manager (OpenCV Windows, Trackbars, Mouse Callbacks)
+# Camera and Ball Tracking Wrapper
 # ============================================================================
+
+class CameraManager:
+    """
+    Manages camera capture and ball detection.
+    Wraps BallDetector for integration with control loop.
+    """
+    
+    def __init__(self, camera_id=0, config_file="config.json", calib_file="cal/camera_calib.npz"):
+        """
+        Initialize camera and ball detector.
+        
+        Args:
+            camera_id: Camera device ID (default: 0)
+            config_file: Path to config.json
+            calib_file: Path to camera calibration file
+        """
+        self.cap = cv2.VideoCapture(camera_id)
+        
+        if not self.cap.isOpened():
+            print(f"[CAMERA] Failed to open camera {camera_id}")
+            self.cap = None
+        else:
+            print(f"[CAMERA] Opened camera {camera_id}")
+        
+        # Initialize ball detector
+        self.detector = BallDetector(config_file=config_file, calib_file=calib_file)
+        
+        # Current state
+        self.current_frame = None
+        self.ball_position = None  # (x, y) in meters or None
+        self.ball_detected = False
+    
+    def update(self):
+        """
+        Capture frame and detect ball.
+        
+        Returns:
+            True if frame captured successfully, False otherwise
+        """
+        if self.cap is None:
+            return False
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            return False
+        
+        # Apply camera undistortion if calibration is available
+        if self.detector.has_camera_calib:
+            if self.detector.newK is None:
+                # Compute optimal new camera matrix once
+                h, w = frame.shape[:2]
+                self.detector.newK, roi = cv2.getOptimalNewCameraMatrix(
+                    self.detector.K, self.detector.dist, (w, h), 1, (w, h)
+                )
+            frame = cv2.undistort(frame, self.detector.K, self.detector.dist, None, self.detector.newK)
+        
+        self.current_frame = frame
+        
+        # Detect ball (pass undistort=False since we already undistorted)
+        found, center, radius, (x_m, y_m) = self.detector.detect_ball(frame, undistort=False)
+        
+        if found:
+            self.ball_position = (x_m, y_m)
+            self.ball_detected = True
+        else:
+            self.ball_position = None
+            self.ball_detected = False
+        
+        return True
+    
+    def get_ball_position(self) -> Optional[Tuple[float, float]]:
+        return self.ball_position
+    
+    def get_camera_frame(self) -> Optional[np.ndarray]:
+        return self.current_frame
+    
+    def close(self):
+        """Release camera."""
+        if self.cap is not None:
+            self.cap.release()
+            print("[CAMERA] Camera released")
+
 
 class UIManager:
     """
     Manages OpenCV UI: camera display, PID tuning trackbars, mouse callbacks.
     """
     
-    def __init__(self, state: ControlState, ball_tracker: BallTracker,
+    def __init__(self, state: ControlState, camera_manager: CameraManager,
                  plate_radius_m: float = 0.15, frame_width: int = 640, frame_height: int = 480):
         """
         Initialize UI manager.
         
         Args:
             state: ControlState instance
-            ball_tracker: BallTracker instance
+            camera_manager: CameraManager instance
             plate_radius_m: Plate radius in meters (for pixel-to-platform conversion)
             frame_width: Camera frame width in pixels
             frame_height: Camera frame height in pixels
         """
         self.state = state
-        self.ball_tracker = ball_tracker
+        self.camera_manager = camera_manager
         
-        # Calibration parameters (assumed - should be calibrated)
+        # Get calibration from ball detector
+        detector = camera_manager.detector
+        
+        # Use calibrated coordinate frame if available, otherwise fallback
+        if detector.has_coordinate_frame and detector.origin_px is not None:
+            self.plate_center_px = tuple(detector.origin_px.astype(int))
+            self.origin_px = detector.origin_px
+            self.x_axis = detector.x_axis
+            self.y_axis = detector.y_axis
+            self.has_calibration = True
+            print(f"[UI] Using calibrated coordinate frame, origin at {self.plate_center_px}")
+        else:
+            self.plate_center_px = (frame_width // 2, frame_height // 2)
+            self.origin_px = np.array([frame_width / 2, frame_height / 2])
+            self.x_axis = np.array([1.0, 0.0])
+            self.y_axis = np.array([0.0, -1.0])
+            self.has_calibration = False
+            print(f"[UI] No calibration found, using frame center at {self.plate_center_px}")
+        
+        # Use pixel_to_meter_ratio from detector if available
+        if detector.pixel_to_meter_ratio is not None:
+            self.pixel_to_meter_ratio = detector.pixel_to_meter_ratio
+            print(f"[UI] Using calibrated pixel_to_meter_ratio: {self.pixel_to_meter_ratio:.6f} m/px")
+        else:
+            # Fallback: estimate from plate radius
+            self.plate_radius_px = min(frame_width, frame_height) * 0.4
+            self.pixel_to_meter_ratio = plate_radius_m / self.plate_radius_px
+            print(f"[UI] Using estimated pixel_to_meter_ratio: {self.pixel_to_meter_ratio:.6f} m/px")
+        
         self.plate_radius_m = plate_radius_m
         self.frame_width = frame_width
         self.frame_height = frame_height
-        self.plate_center_px = (frame_width // 2, frame_height // 2)
-        
-        # Estimate plate radius in pixels (assume plate fills ~80% of frame)
-        self.plate_radius_px = min(frame_width, frame_height) * 0.4
         
         # OpenCV windows
         self.window_name = "Stewart Platform Control"
@@ -368,6 +522,7 @@ class UIManager:
     def pixel_to_platform(self, u: int, v: int) -> Tuple[float, float]:
         """
         Convert pixel coordinates to platform coordinates (meters).
+        Uses the same calibrated coordinate frame as ball detection.
         
         Args:
             u: Pixel x-coordinate
@@ -375,22 +530,53 @@ class UIManager:
             
         Returns:
             (x, y) in meters, platform coordinates
-            
-        Assumptions:
-        - Camera is mounted directly above platform center
-        - Linear mapping: pixel distance from center → meters
-        - Coordinate system: (0,0) at image center, x right, y up
         """
-        # Convert to coordinates relative to image center
-        dx_px = u - self.plate_center_px[0]
-        dy_px = self.plate_center_px[1] - v  # Invert y (image y increases downward)
-        
-        # Scale to meters (linear mapping)
-        scale = self.plate_radius_m / self.plate_radius_px
-        x_m = dx_px * scale
-        y_m = dy_px * scale
+        if self.has_calibration:
+            # Use calibrated coordinate frame (same as ball detector)
+            ball_px = np.array([u, v], dtype=np.float64)
+            delta_px = ball_px - self.origin_px
+            
+            # Project onto calibrated axes
+            x_m = np.dot(delta_px, self.x_axis) * self.pixel_to_meter_ratio
+            y_m = np.dot(delta_px, self.y_axis) * self.pixel_to_meter_ratio
+        else:
+            # Fallback: simple linear mapping from frame center
+            dx_px = u - self.plate_center_px[0]
+            dy_px = self.plate_center_px[1] - v  # Invert y (image y increases downward)
+            
+            x_m = dx_px * self.pixel_to_meter_ratio
+            y_m = dy_px * self.pixel_to_meter_ratio
         
         return (x_m, y_m)
+    
+    def platform_to_pixel(self, x_m: float, y_m: float) -> Tuple[int, int]:
+        """
+        Convert platform coordinates (meters) to pixel coordinates.
+        Inverse of pixel_to_platform, used for drawing overlays.
+        
+        Args:
+            x_m: X-coordinate in meters
+            y_m: Y-coordinate in meters
+            
+        Returns:
+            (u, v) pixel coordinates
+        """
+        if self.has_calibration:
+            # Use calibrated coordinate frame
+            # x_m = delta · x_axis * ratio  =>  delta · x_axis = x_m / ratio
+            # y_m = delta · y_axis * ratio  =>  delta · y_axis = y_m / ratio
+            # Solve for delta_px: delta = (x_m/ratio) * x_axis + (y_m/ratio) * y_axis
+            delta_px = (x_m / self.pixel_to_meter_ratio) * self.x_axis + \
+                      (y_m / self.pixel_to_meter_ratio) * self.y_axis
+            pixel_pos = self.origin_px + delta_px
+            u = int(pixel_pos[0])
+            v = int(pixel_pos[1])
+        else:
+            # Fallback: simple linear mapping
+            u = int(self.plate_center_px[0] + x_m / self.pixel_to_meter_ratio)
+            v = int(self.plate_center_px[1] - y_m / self.pixel_to_meter_ratio)
+        
+        return (u, v)
     
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse clicks to set target position."""
@@ -404,21 +590,13 @@ class UIManager:
         """Create OpenCV trackbars for PID tuning."""
         cv2.namedWindow(self.control_window)
         
-        # X-axis PID gains (trackbars use integers, scale appropriately)
-        cv2.createTrackbar("Kp_x", self.control_window, 
-                          max(0, min(500, int(self.state.Kp_x * 10))), 500, self.on_trackbar)
-        cv2.createTrackbar("Ki_x", self.control_window, 
-                          max(0, min(200, int(self.state.Ki_x * 100))), 200, self.on_trackbar)
-        cv2.createTrackbar("Kd_x", self.control_window, 
-                          max(0, min(100, int(self.state.Kd_x * 10))), 100, self.on_trackbar)
-        
-        # Y-axis PID gains
-        cv2.createTrackbar("Kp_y", self.control_window, 
-                          max(0, min(500, int(self.state.Kp_y * 10))), 500, self.on_trackbar)
-        cv2.createTrackbar("Ki_y", self.control_window, 
-                          max(0, min(200, int(self.state.Ki_y * 100))), 200, self.on_trackbar)
-        cv2.createTrackbar("Kd_y", self.control_window, 
-                          max(0, min(100, int(self.state.Kd_y * 10))), 100, self.on_trackbar)
+        # PID gains (trackbars use integers, scale appropriately)
+        cv2.createTrackbar("Kp", self.control_window, 
+                          max(0, min(500, int(self.state.Kp * 10))), 500, self.on_trackbar)
+        cv2.createTrackbar("Ki", self.control_window, 
+                          max(0, min(200, int(self.state.Ki * 100))), 200, self.on_trackbar)
+        cv2.createTrackbar("Kd", self.control_window, 
+                          max(0, min(100, int(self.state.Kd * 10))), 100, self.on_trackbar)
         
         # Control parameters
         cv2.createTrackbar("TiltGain", self.control_window, 
@@ -432,13 +610,9 @@ class UIManager:
     
     def update_from_trackbars(self):
         """Read trackbar values and update state."""
-        self.state.Kp_x = cv2.getTrackbarPos("Kp_x", self.control_window) / 10.0
-        self.state.Ki_x = cv2.getTrackbarPos("Ki_x", self.control_window) / 100.0
-        self.state.Kd_x = cv2.getTrackbarPos("Kd_x", self.control_window) / 10.0
-        
-        self.state.Kp_y = cv2.getTrackbarPos("Kp_y", self.control_window) / 10.0
-        self.state.Ki_y = cv2.getTrackbarPos("Ki_y", self.control_window) / 100.0
-        self.state.Kd_y = cv2.getTrackbarPos("Kd_y", self.control_window) / 10.0
+        self.state.Kp = cv2.getTrackbarPos("Kp", self.control_window) / 10.0
+        self.state.Ki = cv2.getTrackbarPos("Ki", self.control_window) / 100.0
+        self.state.Kd = cv2.getTrackbarPos("Kd", self.control_window) / 10.0
         
         self.state.tilt_gain = cv2.getTrackbarPos("TiltGain", self.control_window) / 100.0
         self.state.max_tilt_angle = cv2.getTrackbarPos("MaxTilt", self.control_window)
@@ -459,32 +633,113 @@ class UIManager:
         overlay = frame.copy()
         h, w = overlay.shape[:2]
         
-        # Draw crosshair at center
-        center_x, center_y = w // 2, h // 2
-        cv2.line(overlay, (center_x - 20, center_y), (center_x + 20, center_y), (255, 255, 255), 1)
-        cv2.line(overlay, (center_x, center_y - 20), (center_x, center_y + 20), (255, 255, 255), 1)
-        cv2.putText(overlay, "Center", (center_x + 5, center_y - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Draw platform boundary circle (calibrated)
+        center_x, center_y = self.plate_center_px
         
-        # Draw target position
-        target_x_px = int(center_x + self.state.x_target * self.plate_radius_px / self.plate_radius_m)
-        target_y_px = int(center_y - self.state.y_target * self.plate_radius_px / self.plate_radius_m)
+        # Draw crosshair at calibrated platform center (not frame center)
+        cv2.line(overlay, (center_x - 20, center_y), (center_x + 20, center_y), (0, 255, 255), 2)
+        cv2.line(overlay, (center_x, center_y - 20), (center_x, center_y + 20), (0, 255, 255), 2)
+        cv2.circle(overlay, (center_x, center_y), 5, (0, 255, 255), -1)
+        cv2.putText(overlay, "Origin", (center_x + 10, center_y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        
+        # Draw coordinate axes if calibrated
+        if self.has_calibration:
+            axis_length = 80
+            # X-axis (red)
+            x_end = (int(center_x + self.x_axis[0] * axis_length),
+                    int(center_y + self.x_axis[1] * axis_length))
+            cv2.arrowedLine(overlay, (center_x, center_y), x_end, (0, 0, 255), 2, tipLength=0.3)
+            cv2.putText(overlay, "X", (x_end[0] + 5, x_end[1]),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            # Y-axis (green)
+            y_end = (int(center_x + self.y_axis[0] * axis_length),
+                    int(center_y + self.y_axis[1] * axis_length))
+            cv2.arrowedLine(overlay, (center_x, center_y), y_end, (0, 255, 0), 2, tipLength=0.3)
+            cv2.putText(overlay, "Y", (y_end[0] + 5, y_end[1]),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Draw tick marks along axes to show scale (every 5cm)
+            tick_interval_m = 0.05  # 5cm ticks
+            tick_length = 8
+            max_distance_m = self.plate_radius_m
+            
+            # X-axis tick marks
+            for sign in [1, -1]:
+                distance_m = tick_interval_m
+                while distance_m <= max_distance_m:
+                    tick_px_along_axis = distance_m / self.pixel_to_meter_ratio
+                    tick_center = (int(center_x + sign * self.x_axis[0] * tick_px_along_axis),
+                                  int(center_y + sign * self.x_axis[1] * tick_px_along_axis))
+                    # Perpendicular to x_axis is y_axis
+                    tick_start = (int(tick_center[0] - self.y_axis[0] * tick_length),
+                                 int(tick_center[1] - self.y_axis[1] * tick_length))
+                    tick_end = (int(tick_center[0] + self.y_axis[0] * tick_length),
+                               int(tick_center[1] + self.y_axis[1] * tick_length))
+                    cv2.line(overlay, tick_start, tick_end, (0, 0, 200), 1)
+                    distance_m += tick_interval_m
+            
+            # Y-axis tick marks
+            for sign in [1, -1]:
+                distance_m = tick_interval_m
+                while distance_m <= max_distance_m:
+                    tick_px_along_axis = distance_m / self.pixel_to_meter_ratio
+                    tick_center = (int(center_x + sign * self.y_axis[0] * tick_px_along_axis),
+                                  int(center_y + sign * self.y_axis[1] * tick_px_along_axis))
+                    # Perpendicular to y_axis is x_axis
+                    tick_start = (int(tick_center[0] - self.x_axis[0] * tick_length),
+                                 int(tick_center[1] - self.x_axis[1] * tick_length))
+                    tick_end = (int(tick_center[0] + self.x_axis[0] * tick_length),
+                               int(tick_center[1] + self.x_axis[1] * tick_length))
+                    cv2.line(overlay, tick_start, tick_end, (0, 200, 0), 1)
+                    distance_m += tick_interval_m
+        
+        # Draw target position using calibrated conversion
+        target_x_px, target_y_px = self.platform_to_pixel(self.state.x_target, self.state.y_target)
         if 0 <= target_x_px < w and 0 <= target_y_px < h:
             cv2.drawMarker(overlay, (target_x_px, target_y_px), (0, 255, 0), 
                           cv2.MARKER_CROSS, 20, 2)
             cv2.putText(overlay, "Target", (target_x_px + 5, target_y_px - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
-        # Draw ball position if available
+        # Draw ball position if available (using calibrated conversion)
         if self.state.ball_position is not None:
             x, y = self.state.ball_position
-            ball_x_px = int(center_x + x * self.plate_radius_px / self.plate_radius_m)
-            ball_y_px = int(center_y - y * self.plate_radius_px / self.plate_radius_m)
+            ball_x_px, ball_y_px = self.platform_to_pixel(x, y)
             if 0 <= ball_x_px < w and 0 <= ball_y_px < h:
-                cv2.circle(overlay, (ball_x_px, ball_y_px), 10, (0, 0, 255), 2)
+                cv2.circle(overlay, (ball_x_px, ball_y_px), 10, (255, 0, 255), 2)
                 cv2.putText(overlay, f"Ball: ({x:.3f}, {y:.3f})m", 
                            (ball_x_px + 15, ball_y_px), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.5, (0, 0, 255), 1)
+                           0.5, (255, 0, 255), 2)
+        
+        # Draw commanded normal vector as arrow from origin
+        n = self.state.current_normal
+        if n is not None and np.linalg.norm(n) > 0:
+            # Scale the normal vector for visualization (projection onto platform plane)
+            # The normal vector points "up" from the platform, but we want to show tilt direction
+            # Project the tilt onto the XY plane
+            tilt_scale = 100  # pixels
+            
+            # Normal vector n = [nx, ny, nz]
+            # Tilt direction in platform coordinates is -[nx, ny] (negative because normal tilts opposite to desired motion)
+            tilt_x = -n[0] * tilt_scale
+            tilt_y = -n[1] * tilt_scale
+            
+            # Convert tilt vector to pixel coordinates using calibrated axes
+            if self.has_calibration:
+                tilt_px = tilt_x * self.x_axis / self.pixel_to_meter_ratio + \
+                         tilt_y * self.y_axis / self.pixel_to_meter_ratio
+            else:
+                tilt_px = np.array([tilt_x / self.pixel_to_meter_ratio, 
+                                   -tilt_y / self.pixel_to_meter_ratio])
+            
+            normal_end = (int(center_x + tilt_px[0]), int(center_y + tilt_px[1]))
+            
+            # Draw arrow showing tilt direction (orange/yellow)
+            cv2.arrowedLine(overlay, (center_x, center_y), normal_end, (0, 165, 255), 3, tipLength=0.3)
+            cv2.putText(overlay, "Tilt", (normal_end[0] + 5, normal_end[1] - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
         
         # Draw status text
         y_offset = 30
@@ -510,13 +765,13 @@ class UIManager:
         
         # PID gains
         y_offset += 30
-        cv2.putText(overlay, f"Kp: ({self.state.Kp_x:.1f}, {self.state.Kp_y:.1f})",
+        cv2.putText(overlay, f"Kp: {self.state.Kp:.1f}",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         y_offset += 20
-        cv2.putText(overlay, f"Ki: ({self.state.Ki_x:.2f}, {self.state.Ki_y:.2f})",
+        cv2.putText(overlay, f"Ki: {self.state.Ki:.2f}",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         y_offset += 20
-        cv2.putText(overlay, f"Kd: ({self.state.Kd_x:.1f}, {self.state.Kd_y:.1f})",
+        cv2.putText(overlay, f"Kd: {self.state.Kd:.1f}",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # Instructions
@@ -527,38 +782,37 @@ class UIManager:
         return overlay
 
 
-# ============================================================================
-# Main Control Loop
-# ============================================================================
-
 class ControlLoop:
     """
     Main control loop that coordinates all components.
     """
     
-    def __init__(self, state: ControlState, ball_tracker: BallTracker,
-                 normal_controller: NormalController, ui_manager: UIManager):
+    def __init__(self, state: ControlState, camera_manager: CameraManager,
+                 normal_controller: NormalController, ui_manager: UIManager,
+                 servo_controller: ArduinoServoController):
         """
         Initialize control loop.
         
         Args:
             state: ControlState instance
-            ball_tracker: BallTracker instance
+            camera_manager: CameraManager instance
             normal_controller: NormalController instance
             ui_manager: UIManager instance
+            servo_controller: ArduinoServoController instance
         """
         self.state = state
-        self.ball_tracker = ball_tracker
+        self.camera_manager = camera_manager
         self.normal_controller = normal_controller
         self.ui_manager = ui_manager
+        self.servo_controller = servo_controller
         
-        # PID controllers
+        # PID controllers (same gains for both X and Y)
         self.pid_x = PIDController(
-            Kp=state.Kp_x, Ki=state.Ki_x, Kd=state.Kd_x,
+            Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
             integral_limit=5.0, output_limit=10.0
         )
         self.pid_y = PIDController(
-            Kp=state.Kp_y, Ki=state.Ki_y, Kd=state.Kd_y,
+            Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
             integral_limit=5.0, output_limit=10.0
         )
         
@@ -588,15 +842,18 @@ class ControlLoop:
         while self.state.running and not self.state.emergency_stop:
             loop_start = time.time()
             
-            # Update PID gains from trackbars
+            # Update camera and ball detection
+            self.camera_manager.update()
+            
+            # Update PID gains from trackbars (same for both X and Y)
             self.ui_manager.update_from_trackbars()
-            self.pid_x.set_gains(self.state.Kp_x, self.state.Ki_x, self.state.Kd_x)
-            self.pid_y.set_gains(self.state.Kp_y, self.state.Ki_y, self.state.Kd_y)
+            self.pid_x.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
+            self.pid_y.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
             self.normal_controller.set_tilt_gain(self.state.tilt_gain)
             self.normal_controller.set_max_tilt_angle(self.state.max_tilt_angle)
             
             # Get ball position
-            ball_pos = self.ball_tracker.get_ball_position()
+            ball_pos = self.camera_manager.get_ball_position()
             self.state.ball_position = ball_pos
             
             # Calculate dt (handle first iteration)
@@ -628,8 +885,8 @@ class ControlLoop:
                 n = self.normal_controller.compute_normal(ux, uy)
                 self.state.current_normal = n
                 
-                # Send to hardware (stub)
-                set_desired_normal(n[0], n[1], n[2])
+                # Send to hardware via Arduino servo controller
+                self.servo_controller.set_normal(n[0], n[1], n[2])
                 
                 # Print diagnostics (throttled to avoid console spam)
                 # Only print every 10 iterations (~10 Hz instead of 100 Hz)
@@ -647,7 +904,7 @@ class ControlLoop:
                           f"Tilt: {tilt_angle:.1f}°")
             
             # Update display
-            frame = self.ball_tracker.get_camera_frame()
+            frame = self.camera_manager.get_camera_frame()
             if frame is not None:
                 overlay = self.ui_manager.draw_overlay(frame)
                 if overlay is not None:
@@ -672,48 +929,62 @@ class ControlLoop:
         
         # Cleanup: set platform to flat
         print("[CLEANUP] Setting platform to flat")
-        set_desired_normal(0.0, 0.0, 1.0)
+        self.servo_controller.set_normal(0.0, 0.0, 1.0)
+        self.camera_manager.close()
         cv2.destroyAllWindows()
         self.state.running = False
 
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
 def main():
     """Main entry point."""
+    print("="*70)
+    print("3D Stewart Platform PID Controller with Ball Detection")
+    print("="*70)
+    
     # Initialize components
     state = ControlState()
-    ball_tracker = BallTracker()
+    
+    # Initialize hardware (Arduino servo controller)
+    print("[INIT] Connecting to Arduino...")
+    servo_controller = ArduinoServoController()
+    
+    # Initialize camera and ball detection
+    print("[INIT] Initializing camera and ball detector...")
+    camera_manager = CameraManager(camera_id=0)
+    
+    # Initialize normal controller
     normal_controller = NormalController(
         tilt_gain=state.tilt_gain,
         max_tilt_angle_deg=state.max_tilt_angle
     )
+    
+    # Initialize UI manager
     ui_manager = UIManager(
         state=state,
-        ball_tracker=ball_tracker,
+        camera_manager=camera_manager,
         plate_radius_m=0.15,  # Adjust based on your platform
         frame_width=640,
         frame_height=480
     )
     
     # Create and run control loop
-    control_loop = ControlLoop(state, ball_tracker, normal_controller, ui_manager)
+    control_loop = ControlLoop(state, camera_manager, normal_controller, ui_manager, servo_controller)
     
     try:
         control_loop.run()
     except KeyboardInterrupt:
         print("\n[STOP] Interrupted by user")
         state.emergency_stop = True
-        set_desired_normal(0.0, 0.0, 1.0)
+        servo_controller.set_normal(0.0, 0.0, 1.0)
+        camera_manager.close()
+        servo_controller.close()
     except Exception as e:
         print(f"[ERROR] Control loop failed: {e}")
         import traceback
         traceback.print_exc()
-        set_desired_normal(0.0, 0.0, 1.0)
+        servo_controller.set_normal(0.0, 0.0, 1.0)
+        camera_manager.close()
+        servo_controller.close()
 
 
 if __name__ == "__main__":
     main()
-
