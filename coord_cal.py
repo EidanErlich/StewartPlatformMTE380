@@ -2,6 +2,8 @@
 import cv2
 import numpy as np
 import argparse
+import json
+from datetime import datetime
 
 # ---- FIXED PLATE GEOMETRY (your setup) ----
 ANGLES_DEG = [0.0, 120.0, 240.0]  # evenly spaced, CCW from +X
@@ -45,12 +47,193 @@ def estimate_pixel_area_for_size(physical_diameter_m, K, working_distance_m=0.5)
     return pixel_area
 
 
-def load_camera_calib(calib_path="camera_calib.npz"):
+def load_camera_calib(calib_path="cal/camera_calib.npz"):
     """Load camera intrinsics from an npz file."""
     data = np.load(calib_path, allow_pickle=True)
     K = data["K"].astype(np.float64)
     dist = data["dist"].astype(np.float64)
     return K, dist
+
+
+class StewartPlatformCalibrator:
+    def __init__(self):
+        self.CAM_INDEX = 0
+        self.current_frame = None
+
+        # Ball color calibration
+        self.hsv_samples = []
+        self.lower_hsv = None
+        self.upper_hsv = None
+
+        # Platform geometry
+        self.platform_center_px = None
+        self.platform_diameter_px = None
+        self.pixel_to_meter_ratio = None
+        self.platform_radius_m = None
+
+        # Phases
+        self.phase = "color"  # "color" -> "platform" -> "complete"
+
+    def mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and self.phase == "color":
+            self.sample_color(x, y)
+
+    def sample_color(self, x, y):
+        """Sample 5x5 HSV region around clicked point for ball color."""
+        if self.current_frame is None:
+            return
+
+        hsv = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2HSV)
+        region = hsv[max(0, y-2):y+3, max(0, x-2):x+3]
+        samples = region.reshape(-1, 3)
+        self.hsv_samples.extend(samples)
+
+        samples = np.array(self.hsv_samples)
+        h_margin, s_margin, v_margin = 10, 30, 30
+        self.lower_hsv = np.maximum(np.min(samples, axis=0) - [h_margin, s_margin, v_margin], [0, 0, 0])
+        self.upper_hsv = np.minimum(np.max(samples, axis=0) + [h_margin, s_margin, v_margin], [179, 255, 255])
+        print(f"[COLOR] Samples: {len(self.hsv_samples)}")
+
+    def detect_platform_circle(self, frame):
+        """Detect circular platform using Hough Circle Transform."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 5)
+        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
+                                   param1=80, param2=30, minRadius=80, maxRadius=300)
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            x, y, r = circles[0][0]
+            self.platform_center_px = (int(x), int(y))
+            self.platform_diameter_px = 2 * int(r)
+            return (x, y, r)
+        return None
+
+    def save_config(self):
+        config = {
+            "timestamp": datetime.now().isoformat(),
+            "camera": {
+                "index": int(self.CAM_INDEX),
+            },
+            "platform": {
+                "center_px": self.platform_center_px,
+                "diameter_px": self.platform_diameter_px,
+                "radius_m": self.platform_radius_m,
+                "pixel_to_meter_ratio": self.pixel_to_meter_ratio
+            },
+            "ball_detection": {
+                "lower_hsv": self.lower_hsv.tolist() if self.lower_hsv is not None else None,
+                "upper_hsv": self.upper_hsv.tolist() if self.upper_hsv is not None else None
+            }
+        }
+        # If a coordinate_frame was computed externally (origin, axes), include it in the saved config
+        global coordinate_frame
+        if coordinate_frame is not None:
+            config["coordinate_frame"] = {
+                'origin_px': coordinate_frame.get('origin_px'),
+                'x_axis': coordinate_frame.get('x_axis'),
+                'y_axis': coordinate_frame.get('y_axis'),
+                'timestamp': coordinate_frame.get('timestamp')
+            }
+        with open("config.json", "w") as f:
+            json.dump(config, f, indent=2)
+        print("[SAVE] Configuration saved to config.json")
+
+    def run(self):
+        cap = cv2.VideoCapture(self.CAM_INDEX)
+        cv2.namedWindow("Calibration")
+        cv2.setMouseCallback("Calibration", self.mouse_callback)
+
+        print("[INFO] Stewart Platform Calibration")
+        print("Phase 1: Click on the ball to sample color. Press 'c' when done.")
+        print("Phase 2: Ensure platform is visible. Press 'p' to detect the platform radius.")
+        print("Enter platform radius (m) when prompted.")
+        print("Press 's' to save. Press 'q' to quit.")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            self.current_frame = frame.copy()
+
+            display = frame.copy()
+
+            # Show detection overlays
+            if self.lower_hsv is not None:
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+                mask = cv2.erode(mask, None, iterations=2)
+                mask = cv2.dilate(mask, None, iterations=2)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    c = max(contours, key=cv2.contourArea)
+                    ((x, y), r) = cv2.minEnclosingCircle(c)
+                    if r > 5:
+                        cv2.circle(display, (int(x), int(y)), int(r), (0, 255, 255), 2)
+
+            if self.platform_center_px and self.platform_diameter_px:
+                cv2.circle(display, self.platform_center_px, self.platform_diameter_px // 2, (255, 0, 0), 2)
+                cv2.circle(display, self.platform_center_px, 5, (0, 255, 0), -1)
+
+            cv2.putText(display, f"Phase: {self.phase}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.imshow("Calibration", display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c') and self.phase == "color":
+                self.phase = "platform"
+                print("[INFO] Color calibration done. Press 'p' to detect platform.")
+            elif key == ord('p') and self.phase == "platform":
+                # For this flow we expect the coordinate_frame (origin & axes) to have been
+                # computed beforehand (outside this class). We still use Hough to get a
+                # reliable pixel radius (r) but we DO NOT use the Hough center; instead
+                # we project the externally-computed origin into image pixels and use
+                # that as the platform center.
+                global coordinate_frame
+                if coordinate_frame is None:
+                    print("[WARN] No precomputed coordinate frame found. Compute origin first, then re-run this step.")
+                    continue
+
+                # try to detect a circle to obtain a pixel radius (we'll override center)
+                result = self.detect_platform_circle(frame)
+                if result is None:
+                    print("[WARN] Could not detect a platform circle to obtain pixel radius. Adjust view or lighting.")
+                    continue
+
+                _, _, r = result
+                print(f"[PLATFORM] Detected radius={r}px (Hough). Using precomputed origin as center.)")
+
+                # ask user for real-world platform radius in meters (keeps previous UX)
+                try:
+                    self.platform_radius_m = float(input("Enter platform radius in meters: "))
+                except Exception:
+                    print("Invalid radius input; try again.")
+                    continue
+
+                # compute pixel-to-meter ratio from measured pixel radius
+                try:
+                    self.pixel_to_meter_ratio = float(self.platform_radius_m) / float(r)
+                    self.platform_diameter_px = int(round(2.0 * float(r)))
+                except Exception:
+                    print("[ERROR] Could not compute pixel-to-meter ratio from radius. Check inputs.")
+                    continue
+
+                # Project the precomputed origin (in pixel coords) to use as platform center
+                try:
+                    K, _ = load_camera_calib()
+                    origin_px = np.array(coordinate_frame.get('origin_px'), dtype=np.float64)
+                    self.platform_center_px = (int(round(origin_px[0])), int(round(origin_px[1])))
+                    print(f"[PLATFORM] Using origin as platform center: ({self.platform_center_px[0]},{self.platform_center_px[1]})")
+                    self.phase = "complete"
+                except Exception as ex:
+                    print(f"[ERROR] Failed using origin as platform center: {ex}")
+            elif key == ord('s') and self.phase == "complete":
+                self.save_config()
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 def detect_pairs_from_frame(frame, K, detector=None, point_diameter_m=POINT_DIAMETER_M,
@@ -338,6 +521,7 @@ def main():
     ap = argparse.ArgumentParser(description="Live plane-normal estimation from 6 screws (3 pairs) on a circular plate.")
     ap.add_argument("--calib", type=str, default="camera_calib.npz", help="npz with K, dist")
     ap.add_argument("--cam", type=int, default=0, help="camera index")
+    ap.add_argument("--fullcal", action="store_true", help="Run full calibration GUI and save config.json then exit")
     args = ap.parse_args()
 
     # Load intrinsics
@@ -452,6 +636,9 @@ def main():
     win_name = "plane normal (live)"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win_name, on_mouse)
+
+    # flag to ensure we only launch the full calibration UI once after computing the coordinate_frame
+    launched_fullcal = False
 
     while True:
         ok, frame = cap.read()
@@ -636,46 +823,72 @@ def main():
         # If stable and coordinate_frame not stored yet, compute it
         global coordinate_frame
         if motors_stable_flag and coordinate_frame is None:
-            # Backproject smoothed image points to approximate 3D using WORKING_DISTANCE_M
-            fx = K[0, 0]
-            fy = K[1, 1] if K.shape[0] > 1 else K[0, 0]
-            cx = K[0, 2]
-            cy = K[1, 2]
-            Z = WORKING_DISTANCE_M
-            pos3 = {}
+            # Work directly in pixel coordinates
+            pos_px = {}
             for m in motor_order:
                 img = motor_smoothed[m]
-                x = (img[0] - cx) * Z / fx
-                y = (img[1] - cy) * Z / fy
-                z = Z
-                pos3[m] = np.array([x, y, z], dtype=np.float64)
+                pos_px[m] = np.array([img[0], img[1]], dtype=np.float64)
 
-            # centroid origin
-            origin = (pos3['A'] + pos3['B'] + pos3['C']) / 3.0
+            # centroid origin in pixels
+            origin_px = (pos_px['A'] + pos_px['B'] + pos_px['C']) / 3.0
             # X axis toward Motor A from origin
-            x_axis = pos3['A'] - origin
+            x_axis = pos_px['A'] - origin_px
             x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-12)
             # provisional vector towards B, remove component along X to get Y in-plane
-            v = pos3['B'] - origin
+            v = pos_px['B'] - origin_px
             v = v - np.dot(v, x_axis) * x_axis
             y_axis = v / (np.linalg.norm(v) + 1e-12)
-            # Z is perpendicular to plane
-            z_axis = np.cross(x_axis, y_axis)
-            z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-12)
-            # ensure z_axis points toward the camera (camera at origin); flip if needed
-            to_cam = -origin
-            if np.dot(z_axis, to_cam) < 0:
-                z_axis = -z_axis
 
             coordinate_frame = {
-                'origin_m': origin.tolist(),
+                'origin_px': origin_px.tolist(),
                 'x_axis': x_axis.tolist(),
                 'y_axis': y_axis.tolist(),
-                'z_axis': z_axis.tolist(),
                 'timestamp': float(t_now)
             }
-            print("Coordinate system stored:")
+            print("Coordinate system stored (in pixels):")
             print(coordinate_frame)
+            # Persist the computed coordinate_frame into config.json so other tools (or --fullcal)
+            # can pick it up. Merge into existing config.json if present.
+            try:
+                cfg_path = "config.json"
+                cfg = {}
+                try:
+                    with open(cfg_path, 'r') as f:
+                        cfg = json.load(f)
+                except FileNotFoundError:
+                    cfg = {}
+                except Exception:
+                    # if file exists but can't be parsed, overwrite it
+                    cfg = {}
+
+                cfg['coordinate_frame'] = coordinate_frame
+                with open(cfg_path, 'w') as f:
+                    json.dump(cfg, f, indent=2)
+                print(f"[SAVE] coordinate_frame written to {cfg_path}")
+            except Exception as ex:
+                print(f"[WARN] Failed to write coordinate_frame to config.json: {ex}")
+
+            # Launch full calibration GUI once now that we have a valid coordinate frame.
+            # Release the main capture and windows first to avoid camera conflicts.
+            try:
+                if not launched_fullcal:
+                    launched_fullcal = True
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    try:
+                        cv2.destroyAllWindows()
+                    except Exception:
+                        pass
+                    print("[INFO] Launching full calibration UI now that coordinate_frame is available...")
+                    calibrator = StewartPlatformCalibrator()
+                    calibrator.CAM_INDEX = args.cam
+                    calibrator.run()
+                    # After calibrator finishes, exit the main program
+                    return
+            except Exception as ex:
+                print(f"[WARN] Failed to write coordinate_frame to config.json: {ex}")
 
         # If we have any paired image points, compute and display pair separations and keep smoothed blobs
         if 'img_pts' in locals() and img_pts is not None:
@@ -728,44 +941,28 @@ def main():
                 cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
                 cv2.putText(disp, f"Motor {mname}", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        # If coordinate frame available, draw X/Y/Z arrows projected into image
+        # If coordinate frame available, draw X/Y axes in image
         if coordinate_frame is not None:
-            # small helper to project camera-frame 3D point to image pixel
-            def project_pt(pt_cam):
-                Xc = pt_cam[0]
-                Yc = pt_cam[1]
-                Zc = pt_cam[2]
-                if Zc == 0:
-                    Zc = 1e-6
-                u = (K[0, 0] * Xc) / Zc + K[0, 2]
-                v = (K[1, 1] * Yc) / Zc + K[1, 2]
-                return int(round(u)), int(round(v))
-
-            origin = np.array(coordinate_frame['origin_m'], dtype=np.float64)
+            origin_px = np.array(coordinate_frame['origin_px'], dtype=np.float64)
             x_axis = np.array(coordinate_frame['x_axis'], dtype=np.float64)
             y_axis = np.array(coordinate_frame['y_axis'], dtype=np.float64)
-            z_axis = np.array(coordinate_frame['z_axis'], dtype=np.float64)
-            # Choose axis length in meters for visualization
-            axis_len_m = 0.1
-            p_o = origin
-            p_x = origin + x_axis * axis_len_m
-            p_y = origin + y_axis * axis_len_m
-            p_z = origin + z_axis * axis_len_m
+            # Choose axis length in pixels for visualization
+            axis_len_px = 100
+            p_o = origin_px
+            p_x = origin_px + x_axis * axis_len_px
+            p_y = origin_px + y_axis * axis_len_px
             try:
-                uo, vo = project_pt(p_o)
-                ux, vx = project_pt(p_x)
-                uy, vy = project_pt(p_y)
-                uz, vz = project_pt(p_z)
-                # draw axes: X=red, Y=green, Z=blue
+                uo, vo = int(round(p_o[0])), int(round(p_o[1]))
+                ux, vx = int(round(p_x[0])), int(round(p_x[1]))
+                uy, vy = int(round(p_y[0])), int(round(p_y[1]))
+                # draw axes: X=red, Y=green
                 cv2.arrowedLine(disp, (uo, vo), (ux, vx), (0, 0, 255), 3, tipLength=0.05)
                 cv2.putText(disp, 'X', (ux + 4, vx + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 cv2.arrowedLine(disp, (uo, vo), (uy, vy), (0, 255, 0), 3, tipLength=0.05)
                 cv2.putText(disp, 'Y', (uy + 4, vy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.arrowedLine(disp, (uo, vo), (uz, vz), (255, 0, 0), 3, tipLength=0.05)
-                cv2.putText(disp, 'Z', (uz + 4, vz + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 cv2.putText(disp, 'Coordinate system stored', (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
             except Exception:
-                # projection failed for degenerate values; skip drawing
+                # drawing failed for degenerate values; skip drawing
                 pass
 
         cv2.imshow(win_name, disp)
