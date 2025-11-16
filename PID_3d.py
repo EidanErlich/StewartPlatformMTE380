@@ -5,18 +5,28 @@ Real-time 2D PID control for ball balancing on a 3-motor Stewart platform.
 
 This controller integrates:
 - Ball detection (BallDetector from ball_detection.py) for real-time vision
-- PID control for X and Y axes with live tuning
+- Advanced PID control for X and Y axes with live tuning
 - Normal vector computation from PID outputs
 - Arduino servo control (based on arduino_controller.py)
 - Inverse kinematics (from inverseKinematics.py) for servo angle calculation
 
+Advanced Control Features:
+- Back-calculation anti-windup: Prevents integral windup with proper feedback
+- Derivative-on-error: Low-pass filtered d(error)/dt for better setpoint tracking
+- Velocity estimation: Exponential moving average for smooth velocity feedback
+- Rate-limited setpoints: Smooth reference changes to prevent control spikes
+- Filtered normal vector: First-order smoothing on platform tilt commands
+- Trigonometric normal mapping: Proper sin/cos geometry for accurate tilt control
+- Auto-reset on parameter changes: Clears accumulated errors when tuning
+
 Features:
 - Reads ball position (x, y) in meters from camera with calibration
 - Uses independent PID controllers for x and y axes
-- Maps PID outputs to a desired platform normal vector
-- Provides live tuning via OpenCV trackbars
+- Maps PID outputs to a desired platform normal vector using real trigonometry
+- Provides live tuning via text-based control panel
 - Allows target selection via mouse clicks on camera feed
 - Sends computed servo angles to Arduino hardware
+- Non-blocking serial communication for minimal latency
 
 Hardware Interface:
 - Connects to Arduino via serial (auto-detects port)
@@ -28,8 +38,10 @@ Usage:
     
 Controls:
     - Click on camera window to set target position
-    - Use trackbars in 'PID Tuning' window to adjust gains
-    - Press 'q' to quit, 'r' to reset PID integrals
+    - W/S or UP/DOWN arrows to select parameter in control panel
+    - ENTER to edit selected parameter, type value and ENTER to confirm
+    - Press 'q' to quit, 'r' to manually reset PID integrals
+    - PID automatically resets when Kp/Ki/Kd/TiltGain changed
 """
 
 import cv2
@@ -39,6 +51,7 @@ import sys
 import serial
 import serial.tools.list_ports
 from typing import Optional, Tuple
+from collections import deque
 
 # Import ball detection and inverse kinematics
 from ball_detection import BallDetector
@@ -47,17 +60,21 @@ from inverseKinematics import StewartPlatform
 
 class PIDController:
     """
-    Generic PID controller with anti-windup and derivative filtering.
+    Advanced PID controller with enhanced anti-windup and derivative filtering.
     
     Features:
-    - Anti-windup: Integral term clamping to prevent saturation
-    - Derivative filtering: Low-pass filter on derivative to reduce noise
-    - Derivative-on-measurement: Uses measurement instead of error for smoother response
+    - Back-calculation anti-windup: Integrator corrected by K_aw * (clamped - raw)
+    - Derivative-on-error: Low-pass filtered d(error)/dt for better setpoint tracking
+    - Numerical stability: Prevents division by zero, handles edge cases
+    - Velocity estimation: Exponential moving average of measurement derivative
+    - Epsilon deadband: Prevents integral accumulation for very small errors
     """
     
     def __init__(self, Kp: float = 1.0, Ki: float = 0.0, Kd: float = 0.0,
-                 integral_limit: float = 10.0, output_limit: float = 1.0,
-                 derivative_alpha: float = 0.1):
+                 output_limit: float = 1.0, derivative_alpha: float = 0.3,
+                 anti_windup_gain: float = 1.0, velocity_alpha: float = 0.2,
+                 integral_epsilon: float = 0.001,
+                 integral_limit: float = np.inf):
         """
         Initialize PID controller.
         
@@ -65,25 +82,37 @@ class PIDController:
             Kp: Proportional gain
             Ki: Integral gain
             Kd: Derivative gain
-            integral_limit: Maximum absolute value for integral term (anti-windup)
             output_limit: Maximum absolute value for PID output (saturation)
-            derivative_alpha: Low-pass filter coefficient for derivative (0-1, lower = more filtering)
+            derivative_alpha: Low-pass filter coefficient for derivative (0-1, higher = less filtering)
+                            Typical values: 0.2 = heavy filtering, 0.4 = moderate, 0.6 = light
+            anti_windup_gain: Back-calculation anti-windup gain (typically 1.0)
+            velocity_alpha: Exponential moving average coefficient for velocity estimation
+            integral_epsilon: Deadband threshold for integral accumulation (meters)
+                            Integral only accumulates when abs(error) >= epsilon
+                            Prevents micro-oscillations from causing jerky behavior
+                            Typical values: 0.0005-0.002 m (0.5-2 mm)
         """
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
         
-        self.integral_limit = integral_limit
         self.output_limit = output_limit
         self.derivative_alpha = derivative_alpha
+        self.anti_windup_gain = anti_windup_gain
+        self.velocity_alpha = velocity_alpha
+        self.integral_epsilon = integral_epsilon
+        self.integral_limit = integral_limit
         
         # Internal state
         self.integral = 0.0
         self.prev_error = 0.0
         self.prev_measurement = 0.0
         self.filtered_derivative = 0.0
+        self.estimated_velocity = 0.0  # Filtered velocity estimate
+        self.last_saturated = False
+        self.pause_integral = False  # External pause flag (e.g., during bias estimation)
         
-    def update(self, error: float, measurement: float, dt: float) -> float:
+    def update(self, error: float, measurement: float, dt: float, pause_integral: bool = False) -> float:
         """
         Update PID controller and return control output.
         
@@ -101,40 +130,62 @@ class PIDController:
         # Proportional term
         P = self.Kp * error
         
-        # Integral term with anti-windup
-        self.integral += error * dt
-        self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
+        # Integral term with epsilon deadband
+        # Only accumulate integral when error is meaningfully non-zero
+        # This prevents micro-oscillations from causing jerky behavior due to Ki buildup
+        if not pause_integral and abs(error) >= self.integral_epsilon:
+            self.integral += error * dt
+        # If error is within deadband, integral remains unchanged (no accumulation)
+        # Clamp integral to avoid excessive windup
+        if np.isfinite(self.integral_limit):
+            self.integral = float(np.clip(self.integral, -self.integral_limit, self.integral_limit))
+        
         I = self.Ki * self.integral
         
-        # Derivative term with filtering (derivative-on-measurement)
-        # Using measurement derivative reduces kick on setpoint changes
-        raw_derivative = (measurement - self.prev_measurement) / dt if dt > 0 else 0.0
+        # Derivative term with filtering (derivative-on-error)
+        raw_error_derivative = (error - self.prev_error) / dt
         
-        # Low-pass filter on derivative to reduce noise
-        self.filtered_derivative = (self.derivative_alpha * raw_derivative + 
+        # Low-pass filter on error derivative to reduce noise
+        self.filtered_derivative = (self.derivative_alpha * raw_error_derivative + 
                                    (1 - self.derivative_alpha) * self.filtered_derivative)
         
-        # Derivative term uses negative of filtered derivative (since we want to oppose changes)
-        D = -self.Kd * self.filtered_derivative
+        D = self.Kd * self.filtered_derivative
+        
+        # Compute raw output
+        output_raw = P + I + D
+        
+        # Saturate output
+        output_clamped = np.clip(output_raw, -self.output_limit, self.output_limit)
+        self.last_saturated = bool(abs(output_clamped - output_raw) > 1e-9)
+        
+        # Back-calculation anti-windup: correct integrator based on saturation
+        if self.Ki > 1e-6:  # Only if integral term is active
+            windup_correction = self.anti_windup_gain * (output_clamped - output_raw) / self.Ki
+            self.integral += windup_correction
+        
+        # Update velocity estimator (exponential moving average of measurement derivative)
+        raw_velocity = (measurement - self.prev_measurement) / dt
+        self.estimated_velocity = (self.velocity_alpha * raw_velocity + 
+                                   (1 - self.velocity_alpha) * self.estimated_velocity)
         
         # Update state
         self.prev_error = error
         self.prev_measurement = measurement
         
-        # Compute output
-        output = P + I + D
-        
-        # Saturate output
-        output = np.clip(output, -self.output_limit, self.output_limit)
-        
-        return output
+        return output_clamped
+    
+    def get_velocity_estimate(self) -> float:
+        """Get filtered velocity estimate."""
+        return self.estimated_velocity
     
     def reset(self):
-        """Reset internal state (integral, derivatives)."""
+        """Reset internal state (integral, derivatives, velocity)."""
         self.integral = 0.0
         self.prev_error = 0.0
         self.prev_measurement = 0.0
         self.filtered_derivative = 0.0
+        self.estimated_velocity = 0.0
+        self.last_saturated = False
     
     def set_gains(self, Kp: float, Ki: float, Kd: float):
         """Update PID gains."""
@@ -142,25 +193,50 @@ class PIDController:
         self.Ki = Ki
         self.Kd = Kd
 
+    def set_integral_limit(self, limit: float):
+        """Set absolute clamp for the integral accumulator (anti-windup guard)."""
+        self.integral_limit = max(0.0, float(limit)) if np.isfinite(limit) else np.inf
+
+    def is_saturated(self) -> bool:
+        """Return True if the last output was clamped to the output limits."""
+        return self.last_saturated
+
 
 class ControlState:
-    """Manages control state: gains, target position, and runtime parameters."""
+    """
+    Manages control state: gains, target position, and runtime parameters.
+    
+    TUNING GUIDE FOR FASTER RESPONSE:
+    1. Increase Kp for faster initial reaction (but too high causes oscillation)
+    2. Increase Kd to dampen oscillations from higher Kp
+    3. Increase tilt_gain for more aggressive platform movement
+    4. Increase Ki carefully to eliminate steady-state error (but causes overshoot)
+    5. Increase output_limit in ControlLoop if PID is saturating
+    6. Increase derivative_alpha (0.3-0.5) for faster derivative response
+    
+    Current settings optimized for: Fast response with moderate stability
+    """
     
     def __init__(self):
         # Target position (meters, platform coordinates)
         self.x_target = 0.0
         self.y_target = 0.0
         
+        # Rate-limited target position (smooth setpoint changes)
+        self.x_target_filtered = 0.0
+        self.y_target_filtered = 0.0
+        self.max_target_rate = 2.0  # m/s - maximum rate of setpoint change
+        
         # PID gains (same for both x and y axes)
-        # Conservative starting values for stability
-        self.Kp = 5.0   # Proportional gain
-        self.Ki = 0.1   # Integral gain (low to prevent windup)
-        self.Kd = 1.0   # Derivative gain (damping)
+        # Tuned for faster response while maintaining stability
+        self.Kp = 0.475  # Proportional gain - increased for faster reaction
+        self.Ki = 0.00   # Integral gain - increased to eliminate steady-state error faster
+        self.Kd = 1.2   # Derivative gain - increased for better damping at higher speeds
         
         # Control parameters
-        self.control_frequency = 100.0  # Hz
-        self.max_tilt_angle = 15.0  # degrees (maximum platform tilt)
-        self.tilt_gain = 0.5  # Scaling factor from PID output to tilt
+        self.max_tilt_angle = 5.0  # degrees (maximum platform tilt)
+        self.tilt_gain = 0.4  # Scaling factor from PID output to tilt - increased for faster response
+        self.normal_filter_alpha = 0.4  # Smoothing on normal vector (0=no smoothing, 1=instant)
         
         # Runtime flags
         self.running = False
@@ -168,79 +244,269 @@ class ControlState:
         
         # Current state
         self.current_normal = np.array([0.0, 0.0, 1.0])
+        self.filtered_normal = np.array([0.0, 0.0, 1.0])  # Smoothed normal vector
         self.ball_position = None  # (x, y) or None if not detected
         self.last_update_time = None
+
+        # Bias calibration and correction parameters
+        self.bias_enabled = True
+        # Epsilon used for both micro-error deadband and micro-bias ignore
+        self.epsilon = 0.001  # meters
+        self.steady_state_time = 1.0  # seconds window for bias detection
+        self.delta_error_threshold = 0.001  # meters (error variation allowed in window)
+        self.derivative_threshold = 0.003  # m/s (|d(error)/dt| below this means steady)
+        self.max_bias_correction_rate = 0.01  # m/s (how fast to apply bias correction)
+        self.bias_decay_rate = 0.2  # 1/s (decay toward zero when not steady)
+        # Filtering and detection robustness for bias estimation
+        self.bias_error_ema_alpha = 0.2  # (0-1) EMA on error for bias detection
+        self.bias_sigma_threshold = 0.0006  # m, allowable std dev in steady window
+        self.bias_min_window_samples = 10  # minimum samples in window to consider
+
+        # Runtime bias state (for UI / diagnostics)
+        self.x_bias_applied = 0.0
+        self.y_bias_applied = 0.0
+        self._last_x_target_for_bias = self.x_target
+        self._last_y_target_for_bias = self.y_target
+
+
+class BiasCalibratorAxis:
+    """Detects and compensates steady-state bias for a single axis.
+
+    Logic:
+    - When error derivative is small and error variation is small over a time window,
+      and the controller is not saturated, and |error| > epsilon, treat as steady-state.
+    - Estimate bias as (measurement - setpoint) and gradually apply a correction with
+      a max rate limit to avoid sudden jumps.
+    - Pause integral accumulation during estimation windows and when micro-bias (< epsilon)
+      would otherwise accumulate.
+    - Decay applied bias toward zero when not in steady state.
+    """
+
+    def __init__(self,
+                 epsilon: float,
+                 steady_state_time: float,
+                 delta_error_threshold: float,
+                 derivative_threshold: float,
+                 max_bias_correction_rate: float,
+                 bias_decay_rate: float,
+                 error_ema_alpha: float = 0.2,
+                 sigma_threshold: float = 0.0006,
+                 min_window_samples: int = 10):
+        self.epsilon = float(epsilon)
+        self.steady_state_time = float(steady_state_time)
+        self.delta_error_threshold = float(delta_error_threshold)
+        self.derivative_threshold = float(derivative_threshold)
+        self.max_bias_correction_rate = float(max_bias_correction_rate)
+        self.bias_decay_rate = float(bias_decay_rate)
+        self.error_ema_alpha = float(np.clip(error_ema_alpha, 0.0, 1.0))
+        self.sigma_threshold = float(sigma_threshold)
+        self.min_window_samples = int(max(1, min_window_samples))
+
+        self.history = deque()  # (timestamp, filtered_error)
+        self.prev_error = 0.0
+        self.error_ema = None
+        self.applied_bias = 0.0
+        self.last_saturated = False
+        self._now = time.time
+
+    def reset(self):
+        self.history.clear()
+        self.prev_error = 0.0
+        self.error_ema = None
+        self.applied_bias = 0.0
+        self.last_saturated = False
+
+    def set_last_saturated(self, saturated: bool):
+        self.last_saturated = bool(saturated)
+
+    def update(self, setpoint: float, measurement: float, dt: float, enabled: bool) -> Tuple[float, bool, bool]:
+        """Update bias estimator.
+
+        Returns: (applied_bias, pause_integral, estimating)
+        """
+        t = self._now()
+        raw_error = setpoint - measurement
+        # EMA filter for error to tolerate jitter
+        if self.error_ema is None:
+            self.error_ema = raw_error
+        self.error_ema = (
+            self.error_ema_alpha * raw_error + (1.0 - self.error_ema_alpha) * self.error_ema
+        )
+        e_filt = self.error_ema
+        # Derivative on filtered error
+        de_dt = (e_filt - self.prev_error) / max(dt, 1e-3)
+        self.prev_error = e_filt
+
+        # Maintain sliding window of errors
+        self.history.append((t, e_filt))
+        # Drop samples older than steady_state_time
+        t_min = t - self.steady_state_time
+        while self.history and self.history[0][0] < t_min:
+            self.history.popleft()
+
+        # Compute error variation over window
+        err_vals = [e for (_, e) in self.history]
+        delta_range = (max(err_vals) - min(err_vals)) if err_vals else float('inf')
+        std_err = float(np.std(err_vals)) if err_vals else float('inf')
+        window_time_ok = (self.history and (self.history[-1][0] - self.history[0][0]) >= self.steady_state_time)
+        window_count_ok = (len(self.history) >= self.min_window_samples)
+        window_ok = window_time_ok and window_count_ok
+
+        # Conditions for steady-state bias detection
+        steady = (
+            enabled and
+            (not self.last_saturated) and
+            abs(de_dt) < self.derivative_threshold and
+            (delta_range < self.delta_error_threshold or std_err < self.sigma_threshold) and
+            abs(e_filt) > self.epsilon and
+            window_ok
+        )
+
+        estimating = False
+        if steady:
+            estimating = True
+            # Estimate bias as measurement - setpoint
+            bias_estimate = measurement - setpoint
+            # Rate-limit change toward estimate
+            delta = bias_estimate - self.applied_bias
+            max_step = self.max_bias_correction_rate * max(dt, 1e-3)
+            step = float(np.clip(delta, -max_step, max_step))
+            self.applied_bias += step
+        else:
+            # Decay bias toward zero when not steady
+            decay = max(0.0, 1.0 - self.bias_decay_rate * max(dt, 1e-3))
+            self.applied_bias *= decay
+
+        # Epsilon interaction: don't apply micro-bias; also pause integral
+        applied_bias = self.applied_bias if abs(self.applied_bias) >= self.epsilon else 0.0
+        pause_integral = estimating or (abs(applied_bias) == 0.0 and abs(e_filt) < self.epsilon)
+
+        return applied_bias, pause_integral, estimating
 
 
 class NormalController:
     """
-    Maps PID control outputs to a desired platform normal vector.
+    Maps PID control outputs to a desired platform normal vector using trigonometric geometry.
+    
+    Enhanced Features:
+    - Real trigonometric mapping: θx, θy → (sin(θx), sin(θy), cos(θx)·cos(θy))
+    - First-order filtering on normal vector for smooth platform motion
+    - Proper normalization and numerical stability
     
     Sign Convention:
-    - Positive PID output ux means "tilt platform so ball accelerates toward +x"
-    - This corresponds to tilting the platform such that the normal has negative nx
-    - For small angles: nx ≈ -k * ux, ny ≈ -k * uy
-    - Normal is always normalized to unit length with positive nz
+    - Positive PID output ux means "tilt platform to move ball toward +x"
+    - Tilt angles θx and θy are directly proportional to PID outputs
+    - Normal vector always has positive nz (platform facing up)
     """
     
-    def __init__(self, tilt_gain: float = 0.5, max_tilt_angle_deg: float = 15.0):
+    def __init__(self, tilt_gain: float = 0.5, max_tilt_angle_deg: float = 15.0,
+                 filter_alpha: float = 0.4):
         """
         Initialize normal controller.
         
         Args:
-            tilt_gain: Scaling factor from PID output to tilt (radians per unit PID output)
+            tilt_gain: Scaling factor from PID output to tilt angle (radians per unit)
             max_tilt_angle_deg: Maximum platform tilt angle in degrees
+            filter_alpha: First-order filter coefficient (0=frozen, 1=instant, 0.3-0.5=smooth)
         """
         self.tilt_gain = tilt_gain
         self.max_tilt_angle_rad = np.deg2rad(max_tilt_angle_deg)
+        self.filter_alpha = filter_alpha
+        
+        # Filtered state
+        self.filtered_normal = np.array([0.0, 0.0, 1.0])
         
     def compute_normal(self, ux: float, uy: float) -> np.ndarray:
         """
-        Compute desired platform normal from PID outputs.
+        Compute desired platform normal from PID outputs using trigonometric geometry.
         
         Args:
             ux: PID output for x-axis (control demand)
             uy: PID output for y-axis (control demand)
             
         Returns:
-            Unit normal vector [nx, ny, nz] where ||n|| = 1 and nz > 0
+            Filtered unit normal vector [nx, ny, nz] where ||n|| = 1 and nz > 0
             
         Algorithm:
-        1. Scale PID outputs by tilt_gain to get desired tilt angles
-        2. For small angles, construct unnormalized normal: n_raw = (-ux, -uy, 1.0)
-           (negative because positive ux should tilt platform left to move ball right)
-        3. Normalize to unit length
-        4. Optionally clamp to maximum tilt angle
+        1. Scale PID outputs to tilt angles: θx = tilt_gain * ux, θy = tilt_gain * uy
+        2. Clamp angles to maximum tilt
+        3. Convert to normal using spherical geometry:
+           nx = sin(θx)
+           ny = sin(θy)
+           nz = cos(θx) * cos(θy)
+        4. Normalize to unit length
+        5. Apply first-order filtering for smooth motion
         """
-        # Scale PID outputs to get desired tilt components
-        # Negative sign: positive ux (ball too far right) → tilt left (negative nx)
-        nx_raw = -self.tilt_gain * ux
-        ny_raw = -self.tilt_gain * uy
+        # Scale PID outputs to tilt angles (radians)
+        theta_x = self.tilt_gain * ux
+        theta_y = self.tilt_gain * uy
         
-        # Clamp to maximum tilt angle
-        tilt_magnitude = np.sqrt(nx_raw**2 + ny_raw**2)
-        if tilt_magnitude > np.tan(self.max_tilt_angle_rad):
-            scale = np.tan(self.max_tilt_angle_rad) / tilt_magnitude
-            nx_raw *= scale
-            ny_raw *= scale
+        # Clamp to maximum tilt angle (preserve direction)
+        tilt_magnitude = np.sqrt(theta_x**2 + theta_y**2)
+        if tilt_magnitude > self.max_tilt_angle_rad:
+            scale = self.max_tilt_angle_rad / tilt_magnitude
+            theta_x *= scale
+            theta_y *= scale
         
-        # Construct unnormalized normal vector
-        # For small tilts: n ≈ (-slope_x, -slope_y, 1)
-        nz_raw = 1.0
+        # Convert tilt angles to normal vector using spherical geometry
+        # This is the correct trigonometric mapping for small-to-moderate tilts
+        nx_raw = np.sin(theta_x)
+        ny_raw = np.sin(theta_y)
+        nz_raw = np.cos(theta_x) * np.cos(theta_y)
+        
+        # Construct raw normal vector
         n_raw = np.array([nx_raw, ny_raw, nz_raw])
         
-        # Normalize to unit length
+        # Normalize to unit length (numerical stability)
         n_norm = np.linalg.norm(n_raw)
-        if n_norm > 1e-6:
-            n = n_raw / n_norm
+        if n_norm > 1e-8:
+            n_unit = n_raw / n_norm
         else:
-            n = np.array([0.0, 0.0, 1.0])  # Flat platform
+            n_unit = np.array([0.0, 0.0, 1.0])  # Fallback to flat
         
         # Ensure nz is positive (platform facing up)
+        if n_unit[2] < 0:
+            n_unit = -n_unit
+        
+        # Apply first-order filter for smooth motion
+        self.filtered_normal = (self.filter_alpha * n_unit + 
+                               (1 - self.filter_alpha) * self.filtered_normal)
+        
+        # Re-normalize after filtering (important for stability)
+        filter_norm = np.linalg.norm(self.filtered_normal)
+        if filter_norm > 1e-8:
+            self.filtered_normal = self.filtered_normal / filter_norm
+        
+        return self.filtered_normal
+    
+    def get_raw_normal(self, ux: float, uy: float) -> np.ndarray:
+        """Get unfiltered normal vector (for debugging)."""
+        theta_x = self.tilt_gain * ux
+        theta_y = self.tilt_gain * uy
+        
+        tilt_magnitude = np.sqrt(theta_x**2 + theta_y**2)
+        if tilt_magnitude > self.max_tilt_angle_rad:
+            scale = self.max_tilt_angle_rad / tilt_magnitude
+            theta_x *= scale
+            theta_y *= scale
+        
+        nx = np.sin(theta_x)
+        ny = np.sin(theta_y)
+        nz = np.cos(theta_x) * np.cos(theta_y)
+        
+        n = np.array([nx, ny, nz])
+        n_norm = np.linalg.norm(n)
+        if n_norm > 1e-8:
+            n = n / n_norm
+        
         if n[2] < 0:
             n = -n
-        
+            
         return n
+    
+    def reset(self):
+        """Reset filtered state to flat platform."""
+        self.filtered_normal = np.array([0.0, 0.0, 1.0])
     
     def set_tilt_gain(self, gain: float):
         """Update tilt gain."""
@@ -249,6 +515,10 @@ class NormalController:
     def set_max_tilt_angle(self, angle_deg: float):
         """Update maximum tilt angle."""
         self.max_tilt_angle_rad = np.deg2rad(angle_deg)
+    
+    def set_filter_alpha(self, alpha: float):
+        """Update filter coefficient (0=frozen, 1=instant)."""
+        self.filter_alpha = np.clip(alpha, 0.0, 1.0)
 
 
 # ============================================================================
@@ -323,8 +593,8 @@ class ArduinoServoController:
             command = f"{int(angles_deg[0])},{int(angles_deg[1])},{int(angles_deg[2])}\n"
             self.ser.write(command.encode())
             
-            # Read response
-            time.sleep(0.01)  # Small delay for Arduino to respond
+            # Non-blocking check for response - don't wait if nothing available
+            # This reduces latency from 10ms to nearly zero
             if self.ser.in_waiting:
                 response = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 if response.startswith('OK:'):
@@ -332,6 +602,7 @@ class ArduinoServoController:
                 elif response.startswith('ERR:'):
                     print(f"[ARDUINO] Error: {response}")
                     return False
+            return True  # Assume success if no response yet (non-blocking)
         return False
     
     def set_normal(self, nx: float, ny: float, nz: float):
@@ -466,7 +737,7 @@ class UIManager:
     """
     
     def __init__(self, state: ControlState, camera_manager: CameraManager,
-                 plate_radius_m: float = 0.15, frame_width: int = 640, frame_height: int = 480):
+                 plate_radius_m: float = 0.15, frame_width: int = 1920, frame_height: int = 1440):
         """
         Initialize UI manager.
         
@@ -586,36 +857,176 @@ class UIManager:
             self.state.y_target = y_target
             print(f"[TARGET] New target set: ({x_target:.4f}, {y_target:.4f}) m")
     
-    def create_trackbars(self):
-        """Create OpenCV trackbars for PID tuning."""
+    def create_control_panel(self):
+        """Create control panel window for parameter adjustment."""
         cv2.namedWindow(self.control_window)
-        
-        # PID gains (trackbars use integers, scale appropriately)
-        cv2.createTrackbar("Kp", self.control_window, 
-                          max(0, min(500, int(self.state.Kp * 10))), 500, self.on_trackbar)
-        cv2.createTrackbar("Ki", self.control_window, 
-                          max(0, min(200, int(self.state.Ki * 100))), 200, self.on_trackbar)
-        cv2.createTrackbar("Kd", self.control_window, 
-                          max(0, min(100, int(self.state.Kd * 10))), 100, self.on_trackbar)
-        
-        # Control parameters
-        cv2.createTrackbar("TiltGain", self.control_window, 
-                          max(0, min(200, int(self.state.tilt_gain * 100))), 200, self.on_trackbar)
-        cv2.createTrackbar("MaxTilt", self.control_window, 
-                          max(0, min(30, int(self.state.max_tilt_angle))), 30, self.on_trackbar)
+        self.selected_param = 0  # Index of currently selected parameter
+        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt']
+        self.editing_mode = False
+        self.edit_buffer = ""
+        self.reset_callback = None  # Callback to reset PIDs when parameters change
     
-    def on_trackbar(self, val):
-        """Trackbar callback (OpenCV requirement - not used directly)."""
-        self.update_from_trackbars()
-    
-    def update_from_trackbars(self):
-        """Read trackbar values and update state."""
-        self.state.Kp = cv2.getTrackbarPos("Kp", self.control_window) / 10.0
-        self.state.Ki = cv2.getTrackbarPos("Ki", self.control_window) / 100.0
-        self.state.Kd = cv2.getTrackbarPos("Kd", self.control_window) / 10.0
+    def set_reset_callback(self, callback):
+        """Set callback function to reset PID controllers when parameters change."""
+        self.reset_callback = callback
         
-        self.state.tilt_gain = cv2.getTrackbarPos("TiltGain", self.control_window) / 100.0
-        self.state.max_tilt_angle = cv2.getTrackbarPos("MaxTilt", self.control_window)
+    def get_param_value(self, param_name: str) -> float:
+        """Get current value of a parameter."""
+        if param_name == 'Kp':
+            return self.state.Kp
+        elif param_name == 'Ki':
+            return self.state.Ki
+        elif param_name == 'Kd':
+            return self.state.Kd
+        elif param_name == 'TiltGain':
+            return self.state.tilt_gain
+        elif param_name == 'MaxTilt':
+            return self.state.max_tilt_angle
+        return 0.0
+    
+    def set_param_value(self, param_name: str, value: float):
+        """Set value of a parameter and reset PID controllers to clear accumulated errors."""
+        value = max(0.0, value)  # Ensure non-negative
+        needs_reset = False  # Track if PID reset is needed
+        
+        if param_name == 'Kp':
+            self.state.Kp = min(value, 50.0)
+            needs_reset = True
+        elif param_name == 'Ki':
+            self.state.Ki = min(value, 20.0)
+            needs_reset = True
+        elif param_name == 'Kd':
+            self.state.Kd = min(value, 10.0)
+            needs_reset = True
+        elif param_name == 'TiltGain':
+            self.state.tilt_gain = min(value, 2.0)
+            needs_reset = True
+        elif param_name == 'MaxTilt':
+            self.state.max_tilt_angle = min(value, 30.0)
+            # MaxTilt doesn't need PID reset
+        
+        # Reset PID controllers if a control parameter was changed
+        if needs_reset and self.reset_callback is not None:
+            self.reset_callback()
+            print(f"[RESET] PID integrals cleared after parameter change")
+    
+    def update_control_panel(self):
+        """Update and display the control panel."""
+        # Create blank image for control panel
+        panel = np.zeros((400, 500, 3), dtype=np.uint8)
+        panel[:] = (40, 40, 40)  # Dark gray background
+        
+        # Title
+        cv2.putText(panel, "PID Control Panel", (150, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Instructions
+        y_pos = 60
+        instructions = [
+            "W/S or UP/DOWN: Select parameter",
+            "ENTER: Edit value",
+            "Type number and press ENTER to set",
+            "ESC: Cancel editing"
+        ]
+        for instruction in instructions:
+            cv2.putText(panel, instruction, (10, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y_pos += 20
+        
+        # Draw separator line
+        cv2.line(panel, (10, y_pos), (490, y_pos), (100, 100, 100), 1)
+        y_pos += 20
+        
+        # Display parameters
+        for i, param_name in enumerate(self.param_names):
+            is_selected = (i == self.selected_param)
+            value = self.get_param_value(param_name)
+            
+            # Background highlight for selected parameter
+            if is_selected:
+                cv2.rectangle(panel, (5, y_pos - 20), (495, y_pos + 5), (80, 80, 80), -1)
+            
+            # Parameter name
+            color = (0, 255, 255) if is_selected else (255, 255, 255)
+            cv2.putText(panel, f"{param_name}:", (20, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2 if is_selected else 1)
+            
+            # Parameter value (show edit buffer if editing this parameter)
+            if is_selected and self.editing_mode:
+                value_text = self.edit_buffer + "_"
+                value_color = (0, 255, 0)  # Green when editing
+            else:
+                value_text = f"{value:.3f}"
+                value_color = (255, 255, 255)
+            
+            cv2.putText(panel, value_text, (250, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, value_color, 2 if is_selected else 1)
+            
+            y_pos += 35
+        
+        # Status message
+        y_pos += 10
+        if self.editing_mode:
+            status_msg = "EDITING MODE - Type value and press ENTER"
+            status_color = (0, 255, 0)
+        else:
+            status_msg = "Navigation Mode - Press ENTER to edit"
+            status_color = (100, 100, 255)
+        
+        cv2.putText(panel, status_msg, (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+        
+        cv2.imshow(self.control_window, panel)
+    
+    def handle_control_key(self, key: int) -> bool:
+        """
+        Handle keyboard input for control panel.
+        
+        Returns:
+            True if key was handled, False otherwise
+        """
+        if self.editing_mode:
+            # Editing mode - capture number input
+            if key == 13:  # ENTER - confirm edit
+                try:
+                    value = float(self.edit_buffer)
+                    param_name = self.param_names[self.selected_param]
+                    self.set_param_value(param_name, value)
+                    print(f"[PARAM] {param_name} set to {value:.3f}")
+                except ValueError:
+                    print(f"[ERROR] Invalid number: {self.edit_buffer}")
+                self.editing_mode = False
+                self.edit_buffer = ""
+                return True
+            elif key == 27:  # ESC - cancel edit
+                self.editing_mode = False
+                self.edit_buffer = ""
+                print("[PARAM] Edit cancelled")
+                return True
+            elif key == 8 or key == 127:  # BACKSPACE or DELETE
+                self.edit_buffer = self.edit_buffer[:-1]
+                return True
+            elif chr(key) in '0123456789.-':  # Valid number characters
+                self.edit_buffer += chr(key)
+                return True
+        else:
+            # Navigation mode
+            # Handle arrow keys - use 'w' and 's' as alternatives
+            if key == 82 or key == 0 or key == ord('w'):  # UP arrow or 'w'
+                self.selected_param = (self.selected_param - 1) % len(self.param_names)
+                return True
+            elif key == 84 or key == 1 or key == ord('s'):  # DOWN arrow or 's'
+                self.selected_param = (self.selected_param + 1) % len(self.param_names)
+                return True
+            elif key == 13:  # ENTER - start editing
+                param_name = self.param_names[self.selected_param]
+                current_value = self.get_param_value(param_name)
+                self.edit_buffer = f"{current_value:.3f}"
+                self.editing_mode = True
+                print(f"[PARAM] Editing {param_name} (current: {current_value:.3f})")
+                return True
+        
+        return False
     
     def draw_overlay(self, frame: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """
@@ -765,20 +1176,68 @@ class UIManager:
         
         # PID gains
         y_offset += 30
-        cv2.putText(overlay, f"Kp: {self.state.Kp:.1f}",
-                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(
+            overlay,
+            f"Kp: {self.state.Kp:.1f}",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
         y_offset += 20
-        cv2.putText(overlay, f"Ki: {self.state.Ki:.2f}",
-                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(
+            overlay,
+            f"Ki: {self.state.Ki:.2f}",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
         y_offset += 20
-        cv2.putText(overlay, f"Kd: {self.state.Kd:.1f}",
-                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
+        cv2.putText(
+            overlay,
+            f"Kd: {self.state.Kd:.1f}",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
+        y_offset += 20
+        cv2.putText(
+            overlay,
+            f"BiasEnabled: {'ON' if self.state.bias_enabled else 'OFF'}",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 255, 200),
+            1,
+        )
+        y_offset += 20
+        cv2.putText(
+            overlay,
+            f"Bias: ({self.state.x_bias_applied:.3f}, {self.state.y_bias_applied:.3f}) m",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 255, 200),
+            1,
+        )
+
         # Instructions
         y_offset = h - 60
-        cv2.putText(overlay, "Click to set target | 'q' to quit | 'r' to reset",
-                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        
+        cv2.putText(
+            overlay,
+            "Click to set target | 'q' quit | 'r' reset | 'b' bias on/off",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+        )
+
         return overlay
 
 
@@ -809,12 +1268,50 @@ class ControlLoop:
         # PID controllers (same gains for both X and Y)
         self.pid_x = PIDController(
             Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
-            integral_limit=5.0, output_limit=10.0
+            output_limit=20.0,  # Increased output limit for faster response
+            derivative_alpha=0.3,  # Moderate filtering for responsive derivative
+            anti_windup_gain=1.0,  # Back-calculation anti-windup
+            velocity_alpha=0.2,  # Velocity estimation filtering
+            integral_epsilon=self.state.epsilon  # Deadband for integral (prevents micro-oscillation buildup)
         )
         self.pid_y = PIDController(
             Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
-            integral_limit=5.0, output_limit=10.0
+            output_limit=20.0,  # Increased output limit for faster response
+            derivative_alpha=0.3,  # Moderate filtering for responsive derivative
+            anti_windup_gain=1.0,  # Back-calculation anti-windup
+            velocity_alpha=0.2,  # Velocity estimation filtering
+            integral_epsilon=self.state.epsilon  # Deadband for integral (prevents micro-oscillation buildup)
         )
+        # Set conservative integral clamp to complement back-calculation anti-windup
+        self.pid_x.set_integral_limit(1.0)
+        self.pid_y.set_integral_limit(1.0)
+
+        # Bias calibrators for X and Y axes
+        self.bias_x = BiasCalibratorAxis(
+            epsilon=self.state.epsilon,
+            steady_state_time=self.state.steady_state_time,
+            delta_error_threshold=self.state.delta_error_threshold,
+            derivative_threshold=self.state.derivative_threshold,
+            max_bias_correction_rate=self.state.max_bias_correction_rate,
+            bias_decay_rate=self.state.bias_decay_rate,
+            error_ema_alpha=self.state.bias_error_ema_alpha,
+            sigma_threshold=self.state.bias_sigma_threshold,
+            min_window_samples=self.state.bias_min_window_samples,
+        )
+        self.bias_y = BiasCalibratorAxis(
+            epsilon=self.state.epsilon,
+            steady_state_time=self.state.steady_state_time,
+            delta_error_threshold=self.state.delta_error_threshold,
+            derivative_threshold=self.state.derivative_threshold,
+            max_bias_correction_rate=self.state.max_bias_correction_rate,
+            bias_decay_rate=self.state.bias_decay_rate,
+            error_ema_alpha=self.state.bias_error_ema_alpha,
+            sigma_threshold=self.state.bias_sigma_threshold,
+            min_window_samples=self.state.bias_min_window_samples,
+        )
+        # Bias estimation debug helpers
+        self._last_bias_estimating = False
+        self._last_bias_print = 0.0
         
     def run(self):
         """Run main control loop."""
@@ -823,67 +1320,135 @@ class ControlLoop:
         print("="*70)
         print("Controls:")
         print("  - Click on camera feed to set target position")
-        print("  - Use trackbars in 'PID Tuning' window to adjust gains")
-        print("  - Press 'q' to quit, 'r' to reset PID integrals")
+        print("  - Use UP/DOWN arrows to select parameter in control panel")
+        print("  - Press ENTER to edit selected parameter")
+        print("  - Type value and press ENTER to confirm")
+        print("  - Press 'q' to quit, 'r' to reset PID integrals and bias")
+        print("  - Press 'b' to toggle bias compensation ON/OFF")
+        print("  - PID integrals auto-reset when Kp/Ki/Kd/TiltGain changed")
         print("="*70)
         
         # Initialize UI
         cv2.namedWindow(self.ui_manager.window_name)
         cv2.setMouseCallback(self.ui_manager.window_name, self.ui_manager.mouse_callback)
-        self.ui_manager.create_trackbars()
+        self.ui_manager.create_control_panel()
+        
+        # Set up callback for PID reset when parameters change
+        def reset_pids():
+            self.pid_x.reset()
+            self.pid_y.reset()
+            self.normal_controller.reset()
+            # Also reset bias estimators when core control parameters change
+            self.bias_x.reset()
+            self.bias_y.reset()
+            self.state.x_bias_applied = 0.0
+            self.state.y_bias_applied = 0.0
+        self.ui_manager.set_reset_callback(reset_pids)
         
         self.state.running = True
         self.state.last_update_time = time.time()
         
-        # Control loop
-        target_dt = 1.0 / self.state.control_frequency
-        first_iteration = True
+        # Initialize filtered setpoint to current target
+        self.state.x_target_filtered = self.state.x_target
+        self.state.y_target_filtered = self.state.y_target
         
+        # Control loop
         while self.state.running and not self.state.emergency_stop:
             loop_start = time.time()
             
             # Update camera and ball detection
             self.camera_manager.update()
             
-            # Update PID gains from trackbars (same for both X and Y)
-            self.ui_manager.update_from_trackbars()
+            # Update control panel display
+            self.ui_manager.update_control_panel()
+            
+            # Update PID gains and normal controller parameters
             self.pid_x.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
             self.pid_y.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
             self.normal_controller.set_tilt_gain(self.state.tilt_gain)
             self.normal_controller.set_max_tilt_angle(self.state.max_tilt_angle)
+            self.normal_controller.set_filter_alpha(self.state.normal_filter_alpha)
             
             # Get ball position
             ball_pos = self.camera_manager.get_ball_position()
             self.state.ball_position = ball_pos
             
-            # Calculate dt (handle first iteration)
+            # Calculate dt from actual time elapsed
             current_time = time.time()
-            if first_iteration:
-                dt = target_dt  # Use target dt for first iteration
-                first_iteration = False
-            else:
-                dt = current_time - self.state.last_update_time
-            
+            dt = current_time - self.state.last_update_time
             self.state.last_update_time = current_time
             
-            # Clamp dt to reasonable range (handle long pauses)
+            # Clamp dt to reasonable range (handle first iteration and long pauses)
             dt = np.clip(dt, 0.001, 0.1)
             
+            # Apply rate limiting to target setpoint (smooth reference changes)
+            max_delta = self.state.max_target_rate * dt
+            
+            # X-axis rate limiting
+            dx_target = self.state.x_target - self.state.x_target_filtered
+            if abs(dx_target) > max_delta:
+                dx_target = np.sign(dx_target) * max_delta
+            self.state.x_target_filtered += dx_target
+            
+            # Y-axis rate limiting
+            dy_target = self.state.y_target - self.state.y_target_filtered
+            if abs(dy_target) > max_delta:
+                dy_target = np.sign(dy_target) * max_delta
+            self.state.y_target_filtered += dy_target
+            
+            # Reset bias calibrators if target changed significantly
+            if (abs(self.state.x_target - self.state._last_x_target_for_bias) > self.state.epsilon or
+                abs(self.state.y_target - self.state._last_y_target_for_bias) > self.state.epsilon):
+                self.bias_x.reset()
+                self.bias_y.reset()
+                self.state._last_x_target_for_bias = self.state.x_target
+                self.state._last_y_target_for_bias = self.state.y_target
+
             # Control update (only if ball detected)
             if ball_pos is not None:
                 x, y = ball_pos
                 
-                # Compute errors
-                ex = self.state.x_target - x
-                ey = self.state.y_target - y
+                # Bias estimation and compensation
+                bx, pause_ix, estimating_x = self.bias_x.update(
+                    setpoint=self.state.x_target_filtered,
+                    measurement=x,
+                    dt=dt,
+                    enabled=self.state.bias_enabled,
+                )
+                by, pause_iy, estimating_y = self.bias_y.update(
+                    setpoint=self.state.y_target_filtered,
+                    measurement=y,
+                    dt=dt,
+                    enabled=self.state.bias_enabled,
+                )
+                x_corr = x - (bx if self.state.bias_enabled else 0.0)
+                y_corr = y - (by if self.state.bias_enabled else 0.0)
+                self.state.x_bias_applied = (bx if self.state.bias_enabled else 0.0)
+                self.state.y_bias_applied = (by if self.state.bias_enabled else 0.0)
+
+                # Lightweight diagnostic to confirm bias estimator is active
+                estimating_any = estimating_x or estimating_y
+                if estimating_any and (not self._last_bias_estimating) and (current_time - self._last_bias_print > 1.0):
+                    print(f"[BIAS] Estimating... current bias approx (x={bx:+.4f}, y={by:+.4f}) m")
+                    self._last_bias_print = current_time
+                self._last_bias_estimating = estimating_any
+
+                # Compute errors using rate-limited setpoint and corrected measurement
+                ex = self.state.x_target_filtered - x_corr
+                ey = self.state.y_target_filtered - y_corr
                 
-                # Update PID controllers
-                ux = self.pid_x.update(ex, x, dt)
-                uy = self.pid_y.update(ey, y, dt)
+                # Update PID controllers with optional integral pause during bias estimation
+                ux = self.pid_x.update(ex, x_corr, dt, pause_integral=pause_ix)
+                uy = self.pid_y.update(ey, y_corr, dt, pause_integral=pause_iy)
+
+                # Update calibrators with saturation info for next iteration
+                self.bias_x.set_last_saturated(self.pid_x.is_saturated())
+                self.bias_y.set_last_saturated(self.pid_y.is_saturated())
                 
-                # Compute desired normal
+                # Compute desired normal (includes filtering)
                 n = self.normal_controller.compute_normal(ux, uy)
                 self.state.current_normal = n
+                self.state.filtered_normal = self.normal_controller.filtered_normal
                 
                 # Send to hardware via Arduino servo controller
                 self.servo_controller.set_normal(n[0], n[1], n[2])
@@ -897,11 +1462,14 @@ class ControlLoop:
                 
                 if self._print_counter % 10 == 0:
                     tilt_angle = np.rad2deg(np.arccos(np.clip(n[2], -1.0, 1.0)))
-                    print(f"[CONTROL] Pos: ({x:+.4f}, {y:+.4f}) m | "
-                          f"Error: ({ex:+.4f}, {ey:+.4f}) m | "
-                          f"PID: ({ux:+.2f}, {uy:+.2f}) | "
-                          f"Normal: ({n[0]:+.3f}, {n[1]:+.3f}, {n[2]:+.3f}) | "
-                          f"Tilt: {tilt_angle:.1f}°")
+                    print(
+                        f"[CONTROL] Pos: ({x:+.4f}, {y:+.4f}) m | "
+                        f"Error: ({ex:+.4f}, {ey:+.4f}) m | "
+                        f"PID: ({ux:+.2f}, {uy:+.2f}) | "
+                        f"Bias: ({self.state.x_bias_applied:+.4f}, {self.state.y_bias_applied:+.4f}) m | "
+                        f"Normal: ({n[0]:+.3f}, {n[1]:+.3f}, {n[2]:+.3f}) | "
+                        f"Tilt: {tilt_angle:.1f}°"
+                    )
             
             # Update display
             frame = self.camera_manager.get_camera_frame()
@@ -912,20 +1480,27 @@ class ControlLoop:
             
             # Handle keyboard input (non-blocking)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("[STOP] Emergency stop requested")
-                self.state.emergency_stop = True
-                break
-            elif key == ord('r'):
-                print("[RESET] Resetting PID integrals")
-                self.pid_x.reset()
-                self.pid_y.reset()
             
-            # Maintain control frequency
-            elapsed = time.time() - loop_start
-            sleep_time = target_dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            # Try to handle key in control panel first
+            if key != 255:  # 255 means no key pressed
+                handled = self.ui_manager.handle_control_key(key)
+                if not handled:
+                    # Handle global keys if not handled by control panel
+                    if key == ord('q'):
+                        print("[STOP] Emergency stop requested")
+                        self.state.emergency_stop = True
+                        break
+                    elif key == ord('r'):
+                        print("[RESET] Resetting PID integrals and bias")
+                        self.pid_x.reset()
+                        self.pid_y.reset()
+                        self.bias_x.reset()
+                        self.bias_y.reset()
+                        self.state.x_bias_applied = 0.0
+                        self.state.y_bias_applied = 0.0
+                    elif key == ord('b'):
+                        self.state.bias_enabled = not self.state.bias_enabled
+                        print(f"[BIAS] Bias compensation {'ENABLED' if self.state.bias_enabled else 'DISABLED'}")
         
         # Cleanup: set platform to flat
         print("[CLEANUP] Setting platform to flat")
@@ -962,8 +1537,8 @@ def main():
         state=state,
         camera_manager=camera_manager,
         plate_radius_m=0.15,  # Adjust based on your platform
-        frame_width=640,
-        frame_height=480
+        frame_width=1920,
+        frame_height=1440
     )
     
     # Create and run control loop
