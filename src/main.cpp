@@ -25,6 +25,11 @@ void setServoAngle(uint8_t servoIndex, int angle) {
   if (servoIndex >= 3) return;
   // Constrain angle to 0-65 degrees
   angle = constrain(angle, 0, 65);
+  if (servoIndex == 0) {
+    // The first effector needs a slight offset
+    angle += 7;
+  }
+
   uint16_t pulse = angleToPulse(angle);
   pwm.setPWM(SERVO_CH[servoIndex], 0, pulse);
   currentAngles[servoIndex] = angle;
