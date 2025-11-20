@@ -247,12 +247,16 @@ class ControlState:
         self.current_normal = np.array([0.0, 0.0, 1.0])
         self.filtered_normal = np.array([0.0, 0.0, 1.0])  # Smoothed normal vector
         self.ball_position = None  # (x, y) or None if not detected
+        self.ball_is_centered = False  # True if ball is within centered tolerance
         self.last_update_time = None
 
         # Bias calibration and correction parameters
         self.bias_enabled = True
         # Epsilon used for both micro-error deadband and micro-bias ignore
         self.epsilon = 0.001  # meters
+        # Centered margin: if error magnitude is below this, ball is considered centered
+        # and control output is set to zero (prevents micro-adjustments)
+        self.centered_tolerance = 0.003  # meters (3mm margin)
         self.steady_state_time = 1.0  # seconds window for bias detection
         self.delta_error_threshold = 0.001  # meters (error variation allowed in window)
         self.derivative_threshold = 0.003  # m/s (|d(error)/dt| below this means steady)
@@ -862,7 +866,7 @@ class UIManager:
         """Create control panel window for parameter adjustment."""
         cv2.namedWindow(self.control_window)
         self.selected_param = 0  # Index of currently selected parameter
-        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt']
+        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol']
         self.editing_mode = False
         self.edit_buffer = ""
         self.reset_callback = None  # Callback to reset PIDs when parameters change
@@ -883,6 +887,8 @@ class UIManager:
             return self.state.tilt_gain
         elif param_name == 'MaxTilt':
             return self.state.max_tilt_angle
+        elif param_name == 'CenterTol':
+            return self.state.centered_tolerance
         return 0.0
     
     def set_param_value(self, param_name: str, value: float):
@@ -905,6 +911,9 @@ class UIManager:
         elif param_name == 'MaxTilt':
             self.state.max_tilt_angle = min(value, 30.0)
             # MaxTilt doesn't need PID reset
+        elif param_name == 'CenterTol':
+            self.state.centered_tolerance = min(value, 0.05)  # Max 5cm
+            # CenterTol doesn't need PID reset
         
         # Reset PID controllers if a control parameter was changed
         if needs_reset and self.reset_callback is not None:
@@ -1110,6 +1119,10 @@ class UIManager:
         # Draw target position using calibrated conversion
         target_x_px, target_y_px = self.platform_to_pixel(self.state.x_target, self.state.y_target)
         if 0 <= target_x_px < w and 0 <= target_y_px < h:
+            # Draw centered tolerance zone as a circle around target
+            tolerance_radius_px = int(self.state.centered_tolerance / self.pixel_to_meter_ratio)
+            cv2.circle(overlay, (target_x_px, target_y_px), tolerance_radius_px, (0, 200, 100), 1)
+            
             cv2.drawMarker(overlay, (target_x_px, target_y_px), (0, 255, 0), 
                           cv2.MARKER_CROSS, 20, 2)
             cv2.putText(overlay, "Target", (target_x_px + 5, target_y_px - 10),
@@ -1120,10 +1133,13 @@ class UIManager:
             x, y = self.state.ball_position
             ball_x_px, ball_y_px = self.platform_to_pixel(x, y)
             if 0 <= ball_x_px < w and 0 <= ball_y_px < h:
-                cv2.circle(overlay, (ball_x_px, ball_y_px), 10, (255, 0, 255), 2)
-                cv2.putText(overlay, f"Ball: ({x:.3f}, {y:.3f})m", 
+                # Change ball color based on whether it's centered
+                ball_color = (0, 255, 0) if self.state.ball_is_centered else (255, 0, 255)
+                cv2.circle(overlay, (ball_x_px, ball_y_px), 10, ball_color, 2)
+                status_text = "CENTERED" if self.state.ball_is_centered else f"({x:.3f}, {y:.3f})m"
+                cv2.putText(overlay, f"Ball: {status_text}", 
                            (ball_x_px + 15, ball_y_px), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.5, (255, 0, 255), 2)
+                           0.5, ball_color, 2)
         
         # Draw commanded normal vector as arrow from origin
         n = self.state.current_normal
@@ -1163,8 +1179,11 @@ class UIManager:
             x, y = self.state.ball_position
             ex = self.state.x_target - x
             ey = self.state.y_target - y
-            cv2.putText(overlay, f"Error: ({ex:.3f}, {ey:.3f}) m",
-                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            error_mag = np.sqrt(ex**2 + ey**2)
+            error_color = (0, 255, 0) if self.state.ball_is_centered else (255, 255, 0)
+            status_str = " [CENTERED]" if self.state.ball_is_centered else ""
+            cv2.putText(overlay, f"Error: {error_mag:.4f}m ({ex:.3f}, {ey:.3f}){status_str}",
+                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, error_color, 2)
             y_offset += 25
         
         n = self.state.current_normal
@@ -1224,6 +1243,16 @@ class UIManager:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (200, 255, 200),
+            1,
+        )
+        y_offset += 20
+        cv2.putText(
+            overlay,
+            f"CenterTol: {self.state.centered_tolerance*1000:.1f}mm",
+            (10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (150, 200, 255),
             1,
         )
 
@@ -1438,9 +1467,25 @@ class ControlLoop:
                 ex = self.state.x_target_filtered - x_corr
                 ey = self.state.y_target_filtered - y_corr
                 
+                # Check if ball is within centered tolerance
+                error_magnitude = np.sqrt(ex**2 + ey**2)
+                is_centered = error_magnitude < self.state.centered_tolerance
+                self.state.ball_is_centered = is_centered
+                
                 # Update PID controllers with optional integral pause during bias estimation
-                ux = self.pid_x.update(ex, x_corr, dt, pause_integral=pause_ix)
-                uy = self.pid_y.update(ey, y_corr, dt, pause_integral=pause_iy)
+                # If ball is centered (within tolerance), output zero and don't update PID
+                if is_centered:
+                    # Ball is centered - set outputs to zero and pause integral
+                    ux = 0.0
+                    uy = 0.0
+                    # Still update PIDs with pause_integral=True to maintain state tracking
+                    # but ignore the output
+                    _ = self.pid_x.update(ex, x_corr, dt, pause_integral=True)
+                    _ = self.pid_y.update(ey, y_corr, dt, pause_integral=True)
+                else:
+                    # Ball is not centered - normal PID control
+                    ux = self.pid_x.update(ex, x_corr, dt, pause_integral=pause_ix)
+                    uy = self.pid_y.update(ey, y_corr, dt, pause_integral=pause_iy)
 
                 # Update calibrators with saturation info for next iteration
                 self.bias_x.set_last_saturated(self.pid_x.is_saturated())
@@ -1463,9 +1508,10 @@ class ControlLoop:
                 
                 if self._print_counter % 10 == 0:
                     tilt_angle = np.rad2deg(np.arccos(np.clip(n[2], -1.0, 1.0)))
+                    centered_str = " [CENTERED]" if is_centered else ""
                     print(
                         f"[CONTROL] Pos: ({x:+.4f}, {y:+.4f}) m | "
-                        f"Error: ({ex:+.4f}, {ey:+.4f}) m | "
+                        f"Error: ({ex:+.4f}, {ey:+.4f}) m{centered_str} | "
                         f"PID: ({ux:+.2f}, {uy:+.2f}) | "
                         f"Bias: ({self.state.x_bias_applied:+.4f}, {self.state.y_bias_applied:+.4f}) m | "
                         f"Normal: ({n[0]:+.3f}, {n[1]:+.3f}, {n[2]:+.3f}) | "
