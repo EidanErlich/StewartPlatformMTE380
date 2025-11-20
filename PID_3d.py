@@ -48,6 +48,7 @@ import cv2
 import numpy as np
 import time
 import sys
+import argparse
 import serial
 import serial.tools.list_ports
 from typing import Optional, Tuple
@@ -655,14 +656,14 @@ class CameraManager:
     Wraps BallDetector for integration with control loop.
     """
     
-    def __init__(self, camera_id=0, config_file="config.json", calib_file="cal/camera_calib.npz"):
+    def __init__(self, camera_id=0, config_file="config.json", calib_file=None):
         """
         Initialize camera and ball detector.
         
         Args:
             camera_id: Camera device ID (default: 0)
             config_file: Path to config.json
-            calib_file: Path to camera calibration file
+            calib_file: Path to camera calibration file (optional, None to disable calibration)
         """
         self.cap = cv2.VideoCapture(camera_id)
         
@@ -1511,8 +1512,32 @@ class ControlLoop:
 
 def main():
     """Main entry point."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="3D Stewart Platform PID Controller with Ball Detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python PID_3d.py                          # Run without camera calibration
+  python PID_3d.py cal/camera_calib.npz      # Run with camera calibration
+        """
+    )
+    parser.add_argument(
+        'calib_file',
+        nargs='?',
+        default=None,
+        help='Path to camera calibration file (.npz). If not provided, camera calibration is disabled.'
+    )
+    args = parser.parse_args()
+    
     print("="*70)
     print("3D Stewart Platform PID Controller with Ball Detection")
+    print("="*70)
+    
+    if args.calib_file:
+        print(f"[CONFIG] Camera calibration file: {args.calib_file}")
+    else:
+        print("[CONFIG] Camera calibration: DISABLED")
     print("="*70)
     
     # Initialize components
@@ -1524,7 +1549,7 @@ def main():
     
     # Initialize camera and ball detection
     print("[INIT] Initializing camera and ball detector...")
-    camera_manager = CameraManager(camera_id=0)
+    camera_manager = CameraManager(camera_id=0, calib_file=args.calib_file)
     
     # Initialize normal controller
     normal_controller = NormalController(
