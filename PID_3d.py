@@ -57,6 +57,9 @@ from typing import Optional, Tuple
 from collections import deque
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import csv
+import os
+from datetime import datetime
 
 # Import ball detection and inverse kinematics
 from ball_detection import BallDetector
@@ -197,11 +200,11 @@ class LivePlotter:
         self.y_outputs.append(y_output)
         
     def update_plot(self):
-        """Update the plot with current data (non-blocking)."""
+        """Update the plot with current data (non-blocking, optimized)."""
         if len(self.times) < 2:
             return
         
-        # Convert deques to numpy arrays for plotting
+        # Convert deques to numpy arrays for plotting (only once)
         times_array = np.array(self.times)
         x_pos_array = np.array(self.x_positions)
         y_pos_array = np.array(self.y_positions)
@@ -226,7 +229,20 @@ class LivePlotter:
         x_output_windowed = x_output_array[mask]
         y_output_windowed = y_output_array[mask]
         
-        # Calculate magnitudes
+        # Downsample for faster plotting (plot every 3rd point if > 300 points)
+        if len(times_windowed) > 300:
+            step = len(times_windowed) // 300
+            times_windowed = times_windowed[::step]
+            x_pos_windowed = x_pos_windowed[::step]
+            y_pos_windowed = y_pos_windowed[::step]
+            x_target_windowed = x_target_windowed[::step]
+            y_target_windowed = y_target_windowed[::step]
+            x_error_windowed = x_error_windowed[::step]
+            y_error_windowed = y_error_windowed[::step]
+            x_output_windowed = x_output_windowed[::step]
+            y_output_windowed = y_output_windowed[::step]
+        
+        # Calculate magnitudes (vectorized)
         distance_from_target = np.sqrt(x_pos_windowed**2 + y_pos_windowed**2)
         error_magnitude = np.sqrt(x_error_windowed**2 + y_error_windowed**2)
         control_magnitude = np.sqrt(x_output_windowed**2 + y_output_windowed**2)
@@ -242,46 +258,58 @@ class LivePlotter:
             self.lines['current_pos'].set_offsets([[x_pos_windowed[-1], y_pos_windowed[-1]]])
             self.lines['target_pos'].set_offsets([[x_target_windowed[-1], y_target_windowed[-1]]])
         
-        # Update control vector scatter (show recent control directions)
+        # Update control vector scatter (show recent control directions, downsample)
         if len(x_output_windowed) > 0:
-            # Create color array based on time (newer = brighter)
-            colors = times_windowed - times_windowed[0]  # Normalize to start at 0
-            self.control_scatter.set_offsets(np.c_[x_output_windowed, y_output_windowed])
+            # Only show last 100 points for scatter plot
+            n_scatter = min(100, len(x_output_windowed))
+            scatter_indices = np.linspace(0, len(x_output_windowed)-1, n_scatter, dtype=int)
+            colors = times_windowed[scatter_indices] - times_windowed[0]
+            self.control_scatter.set_offsets(np.c_[x_output_windowed[scatter_indices], 
+                                                   y_output_windowed[scatter_indices]])
             self.control_scatter.set_array(colors)
         
         # Update component breakdown
         self.lines['x_output'].set_data(times_windowed, x_output_windowed)
         self.lines['y_output'].set_data(times_windowed, y_output_windowed)
         
-        # Auto-scale axes with padding
-        self.ax_distance.relim()
-        self.ax_distance.autoscale_view()
+        # Auto-scale axes with padding (only update limits, skip relim/autoscale for speed)
         self.ax_distance.set_xlim(current_time - self.window_size, current_time)
+        if len(distance_from_target) > 0:
+            y_min, y_max = np.min(distance_from_target), np.max(distance_from_target)
+            y_pad = (y_max - y_min) * 0.1 or 0.01
+            self.ax_distance.set_ylim(y_min - y_pad, y_max + y_pad)
         
-        self.ax_error.relim()
-        self.ax_error.autoscale_view()
         self.ax_error.set_xlim(current_time - self.window_size, current_time)
+        if len(error_magnitude) > 0:
+            y_min, y_max = np.min(error_magnitude), np.max(error_magnitude)
+            y_pad = (y_max - y_min) * 0.1 or 0.01
+            self.ax_error.set_ylim(y_min - y_pad, y_max + y_pad)
         
-        self.ax_control_mag.relim()
-        self.ax_control_mag.autoscale_view()
         self.ax_control_mag.set_xlim(current_time - self.window_size, current_time)
+        if len(control_magnitude) > 0:
+            y_min, y_max = np.min(control_magnitude), np.max(control_magnitude)
+            y_pad = (y_max - y_min) * 0.1 or 0.01
+            self.ax_control_mag.set_ylim(y_min - y_pad, y_max + y_pad)
         
-        self.ax_components.relim()
-        self.ax_components.autoscale_view()
         self.ax_components.set_xlim(current_time - self.window_size, current_time)
+        if len(x_output_windowed) > 0:
+            y_min = min(np.min(x_output_windowed), np.min(y_output_windowed))
+            y_max = max(np.max(x_output_windowed), np.max(y_output_windowed))
+            y_pad = (y_max - y_min) * 0.1 or 0.01
+            self.ax_components.set_ylim(y_min - y_pad, y_max + y_pad)
         
         # Trajectory plot: auto-scale with some padding
         if len(x_pos_windowed) > 0:
-            x_range = [min(np.min(x_pos_windowed), np.min(x_target_windowed)), 
-                      max(np.max(x_pos_windowed), np.max(x_target_windowed))]
-            y_range = [min(np.min(y_pos_windowed), np.min(y_target_windowed)), 
-                      max(np.max(y_pos_windowed), np.max(y_target_windowed))]
+            x_min = min(np.min(x_pos_windowed), np.min(x_target_windowed))
+            x_max = max(np.max(x_pos_windowed), np.max(x_target_windowed))
+            y_min = min(np.min(y_pos_windowed), np.min(y_target_windowed))
+            y_max = max(np.max(y_pos_windowed), np.max(y_target_windowed))
             
-            x_padding = (x_range[1] - x_range[0]) * 0.1 or 0.01
-            y_padding = (y_range[1] - y_range[0]) * 0.1 or 0.01
+            x_padding = (x_max - x_min) * 0.1 or 0.01
+            y_padding = (y_max - y_min) * 0.1 or 0.01
             
-            self.ax_trajectory.set_xlim(x_range[0] - x_padding, x_range[1] + x_padding)
-            self.ax_trajectory.set_ylim(y_range[0] - y_padding, y_range[1] + y_padding)
+            self.ax_trajectory.set_xlim(x_min - x_padding, x_max + x_padding)
+            self.ax_trajectory.set_ylim(y_min - y_padding, y_max + y_padding)
         
         # Control vector plot: auto-scale with padding
         if len(x_output_windowed) > 0:
@@ -290,13 +318,219 @@ class LivePlotter:
                 self.ax_control_vector.set_xlim(-output_range * 1.1, output_range * 1.1)
                 self.ax_control_vector.set_ylim(-output_range * 1.1, output_range * 1.1)
         
-        # Redraw
-        self.fig.canvas.draw()
+        # Redraw (use draw_idle for non-blocking, faster updates)
+        self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
         
     def close(self):
         """Close the plot window."""
         plt.close(self.fig)
+
+
+class CSVLogger:
+    """
+    Efficient CSV logger for control loop data.
+    Logs only measured values during runtime, calculates derived values on shutdown.
+    """
+    
+    def __init__(self, runs_dir: str = "Runs"):
+        """
+        Initialize CSV logger.
+        
+        Args:
+            runs_dir: Directory to save CSV files (default: "Runs")
+        """
+        self.runs_dir = runs_dir
+        self.file_path = None
+        self.csv_file = None
+        self.writer = None
+        self.start_time = None
+        
+        # Data buffer for measured values (to calculate derived values later)
+        self.data_rows = []
+        
+        # Ensure Runs directory exists
+        os.makedirs(runs_dir, exist_ok=True)
+        
+        # Create timestamped filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.file_path = os.path.join(runs_dir, f"run_{timestamp}.csv")
+        
+        # Open file for writing
+        self.csv_file = open(self.file_path, 'w', newline='')
+        self.writer = csv.writer(self.csv_file)
+        
+        # Write header (measured values only, derived values will be added later)
+        self.header = [
+            'time', 'time_elapsed',
+            'x_pos', 'y_pos',
+            'x_target', 'y_target',
+            'x_target_filtered', 'y_target_filtered',
+            'x_error', 'y_error',
+            'x_output', 'y_output',
+            'normal_x', 'normal_y', 'normal_z',
+            'Kp', 'Ki', 'Kd',
+            'tilt_gain', 'max_tilt_angle', 'centered_tolerance',
+            'ball_detected', 'ball_centered',
+            'pid_x_integral', 'pid_y_integral',
+            'pid_x_prev_error', 'pid_y_prev_error'
+        ]
+        self.writer.writerow(self.header)
+        
+        print(f"[CSV] Logging to: {self.file_path}")
+    
+    def log_measured(self, time_abs: float, time_elapsed: float,
+                     x_pos: Optional[float], y_pos: Optional[float],
+                     x_target: float, y_target: float,
+                     x_target_filtered: float, y_target_filtered: float,
+                     x_error: float, y_error: float,
+                     x_output: float, y_output: float,
+                     normal_x: float, normal_y: float, normal_z: float,
+                     Kp: float, Ki: float, Kd: float,
+                     tilt_gain: float, max_tilt_angle: float, centered_tolerance: float,
+                     ball_detected: bool, ball_centered: bool,
+                     pid_x_integral: float, pid_y_integral: float,
+                     pid_x_prev_error: float, pid_y_prev_error: float):
+        """
+        Log measured values to CSV (efficient, no derived calculations).
+        
+        Args:
+            time_abs: Absolute timestamp
+            time_elapsed: Elapsed time since start
+            x_pos, y_pos: Ball position (None if not detected)
+            x_target, y_target: Target position
+            x_target_filtered, y_target_filtered: Rate-limited target
+            x_error, y_error: Position errors
+            x_output, y_output: PID outputs
+            normal_x, normal_y, normal_z: Normal vector components
+            Kp, Ki, Kd: PID gains
+            tilt_gain, max_tilt_angle, centered_tolerance: Control parameters
+            ball_detected: Whether ball was detected
+            ball_centered: Whether ball is centered
+            pid_x_integral, pid_y_integral: PID integral states
+            pid_x_prev_error, pid_y_prev_error: PID previous error states
+        """
+        # Store row data for later derived value calculation
+        row_data = {
+            'time': time_abs,
+            'time_elapsed': time_elapsed,
+            'x_pos': x_pos if x_pos is not None else '',
+            'y_pos': y_pos if y_pos is not None else '',
+            'x_target': x_target,
+            'y_target': y_target,
+            'x_target_filtered': x_target_filtered,
+            'y_target_filtered': y_target_filtered,
+            'x_error': x_error,
+            'y_error': y_error,
+            'x_output': x_output,
+            'y_output': y_output,
+            'normal_x': normal_x,
+            'normal_y': normal_y,
+            'normal_z': normal_z,
+            'Kp': Kp,
+            'Ki': Ki,
+            'Kd': Kd,
+            'tilt_gain': tilt_gain,
+            'max_tilt_angle': max_tilt_angle,
+            'centered_tolerance': centered_tolerance,
+            'ball_detected': 1 if ball_detected else 0,
+            'ball_centered': 1 if ball_centered else 0,
+            'pid_x_integral': pid_x_integral,
+            'pid_y_integral': pid_y_integral,
+            'pid_x_prev_error': pid_x_prev_error,
+            'pid_y_prev_error': pid_y_prev_error
+        }
+        self.data_rows.append(row_data)
+        
+        # Write measured values only (no derived calculations)
+        row = [
+            time_abs, time_elapsed,
+            x_pos if x_pos is not None else '', y_pos if y_pos is not None else '',
+            x_target, y_target,
+            x_target_filtered, y_target_filtered,
+            x_error, y_error,
+            x_output, y_output,
+            normal_x, normal_y, normal_z,
+            Kp, Ki, Kd,
+            tilt_gain, max_tilt_angle, centered_tolerance,
+            1 if ball_detected else 0, 1 if ball_centered else 0,
+            pid_x_integral, pid_y_integral,
+            pid_x_prev_error, pid_y_prev_error
+        ]
+        self.writer.writerow(row)
+    
+    def finalize(self):
+        """
+        Calculate derived values and rewrite CSV with complete data.
+        Called when control loop stops.
+        """
+        if not self.data_rows:
+            self.close()
+            return
+        
+        print("[CSV] Calculating derived values and finalizing log...")
+        
+        # Close the current file
+        self.csv_file.close()
+        
+        # Reopen for writing (overwrite with complete data)
+        self.csv_file = open(self.file_path, 'w', newline='')
+        self.writer = csv.writer(self.csv_file)
+        
+        # Extended header with derived values
+        extended_header = self.header + [
+            'error_magnitude',
+            'output_magnitude',
+            'tilt_angle'
+        ]
+        self.writer.writerow(extended_header)
+        
+        # Calculate derived values and write complete rows
+        for row_data in self.data_rows:
+            # Calculate derived values
+            x_error = row_data['x_error']
+            y_error = row_data['y_error']
+            x_output = row_data['x_output']
+            y_output = row_data['y_output']
+            normal_z = row_data['normal_z']
+            
+            # Error magnitude (always calculated from float values)
+            error_magnitude = np.sqrt(float(x_error)**2 + float(y_error)**2)
+            
+            # Output magnitude (always calculated from float values)
+            output_magnitude = np.sqrt(float(x_output)**2 + float(y_output)**2)
+            
+            # Tilt angle (degrees) from normal vector z-component
+            tilt_angle = np.rad2deg(np.arccos(np.clip(float(normal_z), -1.0, 1.0)))
+            
+            # Write complete row
+            row = [
+                row_data['time'], row_data['time_elapsed'],
+                row_data['x_pos'], row_data['y_pos'],
+                row_data['x_target'], row_data['y_target'],
+                row_data['x_target_filtered'], row_data['y_target_filtered'],
+                row_data['x_error'], row_data['y_error'],
+                row_data['x_output'], row_data['y_output'],
+                row_data['normal_x'], row_data['normal_y'], row_data['normal_z'],
+                row_data['Kp'], row_data['Ki'], row_data['Kd'],
+                row_data['tilt_gain'], row_data['max_tilt_angle'], row_data['centered_tolerance'],
+                row_data['ball_detected'], row_data['ball_centered'],
+                row_data['pid_x_integral'], row_data['pid_y_integral'],
+                row_data['pid_x_prev_error'], row_data['pid_y_prev_error'],
+                error_magnitude,
+                output_magnitude,
+                tilt_angle
+            ]
+            self.writer.writerow(row)
+        
+        print(f"[CSV] Finalized log with {len(self.data_rows)} rows: {self.file_path}")
+        self.close()
+    
+    def close(self):
+        """Close CSV file."""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
 
 
 class PIDController:
@@ -431,6 +665,9 @@ class ControlState:
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
         self.centered_tolerance = 0.015  # meters (3mm margin)
+        
+        # Live plotting toggle
+        self.live_plotting_enabled = False  # Default to disabled (can be enabled via UI)
 
 
 class NormalController:
@@ -910,17 +1147,22 @@ class UIManager:
         """Create control panel window for parameter adjustment."""
         cv2.namedWindow(self.control_window)
         self.selected_param = 0  # Index of currently selected parameter
-        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol']
+        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol', 'LivePlot']
         self.editing_mode = False
         self.edit_buffer = ""
         self.reset_callback = None  # Callback to reset PIDs when parameters change
+        self.plotting_callback = None  # Callback to enable/disable plotting
     
     def set_reset_callback(self, callback):
         """Set callback function to reset PID controllers when parameters change."""
         self.reset_callback = callback
+    
+    def set_plotting_callback(self, callback):
+        """Set callback function to enable/disable plotting when LivePlot is toggled."""
+        self.plotting_callback = callback
         
-    def get_param_value(self, param_name: str) -> float:
-        """Get current value of a parameter."""
+    def get_param_value(self, param_name: str):
+        """Get current value of a parameter. Returns float for numeric params, bool for LivePlot."""
         if param_name == 'Kp':
             return self.state.Kp
         elif param_name == 'Ki':
@@ -933,31 +1175,49 @@ class UIManager:
             return self.state.max_tilt_angle
         elif param_name == 'CenterTol':
             return self.state.centered_tolerance
+        elif param_name == 'LivePlot':
+            return self.state.live_plotting_enabled
         return 0.0
     
-    def set_param_value(self, param_name: str, value: float):
+    def is_boolean_param(self, param_name: str) -> bool:
+        """Check if parameter is boolean (toggle) type."""
+        return param_name == 'LivePlot'
+    
+    def set_param_value(self, param_name: str, value):
         """Set value of a parameter and reset PID controllers to clear accumulated errors."""
-        value = max(0.0, value)  # Ensure non-negative
         needs_reset = False  # Track if PID reset is needed
         
         if param_name == 'Kp':
-            self.state.Kp = min(value, 50.0)
+            value = max(0.0, min(float(value), 50.0))
+            self.state.Kp = value
             needs_reset = True
         elif param_name == 'Ki':
-            self.state.Ki = min(value, 20.0)
+            value = max(0.0, min(float(value), 20.0))
+            self.state.Ki = value
             needs_reset = True
         elif param_name == 'Kd':
-            self.state.Kd = min(value, 10.0)
+            value = max(0.0, min(float(value), 10.0))
+            self.state.Kd = value
             needs_reset = True
         elif param_name == 'TiltGain':
-            self.state.tilt_gain = min(value, 2.0)
+            value = max(0.0, min(float(value), 2.0))
+            self.state.tilt_gain = value
             needs_reset = True
         elif param_name == 'MaxTilt':
-            self.state.max_tilt_angle = min(value, 30.0)
+            value = max(0.0, min(float(value), 30.0))
+            self.state.max_tilt_angle = value
             # MaxTilt doesn't need PID reset
         elif param_name == 'CenterTol':
-            self.state.centered_tolerance = min(value, 0.05)  # Max 5cm
+            value = max(0.0, min(float(value), 0.05))  # Max 5cm
+            self.state.centered_tolerance = value
             # CenterTol doesn't need PID reset
+        elif param_name == 'LivePlot':
+            # Toggle boolean value
+            self.state.live_plotting_enabled = bool(value)
+            if self.plotting_callback is not None:
+                self.plotting_callback(self.state.live_plotting_enabled)
+            print(f"[PLOTTER] Live plotting {'ENABLED' if self.state.live_plotting_enabled else 'DISABLED'}")
+            return  # No reset needed for plotting toggle
         
         # Reset PID controllers if a control parameter was changed
         if needs_reset and self.reset_callback is not None:
@@ -966,8 +1226,8 @@ class UIManager:
     
     def update_control_panel(self):
         """Update and display the control panel."""
-        # Create blank image for control panel
-        panel = np.zeros((400, 500, 3), dtype=np.uint8)
+        # Create blank image for control panel (increased height for new parameter)
+        panel = np.zeros((450, 500, 3), dtype=np.uint8)
         panel[:] = (40, 40, 40)  # Dark gray background
         
         # Title
@@ -978,7 +1238,7 @@ class UIManager:
         y_pos = 60
         instructions = [
             "W/S or UP/DOWN: Select parameter",
-            "ENTER: Edit value",
+            "ENTER: Edit value / Toggle checkbox",
             "Type number and press ENTER to set",
             "ESC: Cancel editing"
         ]
@@ -995,6 +1255,7 @@ class UIManager:
         for i, param_name in enumerate(self.param_names):
             is_selected = (i == self.selected_param)
             value = self.get_param_value(param_name)
+            is_boolean = self.is_boolean_param(param_name)
             
             # Background highlight for selected parameter
             if is_selected:
@@ -1005,24 +1266,63 @@ class UIManager:
             cv2.putText(panel, f"{param_name}:", (20, y_pos),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2 if is_selected else 1)
             
-            # Parameter value (show edit buffer if editing this parameter)
-            if is_selected and self.editing_mode:
-                value_text = self.edit_buffer + "_"
-                value_color = (0, 255, 0)  # Green when editing
+            # Parameter value display
+            if is_boolean:
+                # Boolean parameter - show checkbox
+                checkbox_x = 250
+                checkbox_y = y_pos - 12
+                checkbox_size = 20
+                
+                # Draw checkbox border
+                border_color = (0, 255, 0) if is_selected else (150, 150, 150)
+                cv2.rectangle(panel, (checkbox_x, checkbox_y), 
+                             (checkbox_x + checkbox_size, checkbox_y + checkbox_size), 
+                             border_color, 2)
+                
+                # Draw checkmark if enabled
+                if value:
+                    # Draw filled rectangle with checkmark
+                    cv2.rectangle(panel, (checkbox_x + 2, checkbox_y + 2), 
+                                 (checkbox_x + checkbox_size - 2, checkbox_y + checkbox_size - 2), 
+                                 (0, 255, 0), -1)
+                    # Draw checkmark
+                    cv2.line(panel, (checkbox_x + 5, checkbox_y + 10),
+                            (checkbox_x + 9, checkbox_y + 15), (0, 0, 0), 2)
+                    cv2.line(panel, (checkbox_x + 9, checkbox_y + 15),
+                            (checkbox_x + 15, checkbox_y + 5), (0, 0, 0), 2)
+                
+                # Text label next to checkbox
+                label_text = "ON" if value else "OFF"
+                label_color = (0, 255, 0) if value else (100, 100, 100)
+                if is_selected:
+                    label_color = (0, 255, 255) if value else (255, 200, 0)
+                cv2.putText(panel, label_text, (checkbox_x + checkbox_size + 10, y_pos),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2 if is_selected else 1)
             else:
-                value_text = f"{value:.3f}"
-                value_color = (255, 255, 255)
-            
-            cv2.putText(panel, value_text, (250, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, value_color, 2 if is_selected else 1)
+                # Numeric parameter - show value
+                if is_selected and self.editing_mode:
+                    value_text = self.edit_buffer + "_"
+                    value_color = (0, 255, 0)  # Green when editing
+                else:
+                    value_text = f"{value:.3f}"
+                    value_color = (255, 255, 255)
+                
+                cv2.putText(panel, value_text, (250, y_pos),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, value_color, 2 if is_selected else 1)
             
             y_pos += 35
         
         # Status message
         y_pos += 10
-        if self.editing_mode:
+        selected_param_name = self.param_names[self.selected_param] if self.param_names else ""
+        is_boolean_selected = self.is_boolean_param(selected_param_name)
+        
+        if self.editing_mode and not is_boolean_selected:
             status_msg = "EDITING MODE - Type value and press ENTER"
             status_color = (0, 255, 0)
+        elif is_boolean_selected:
+            status_msg = "Press ENTER to toggle checkbox"
+            status_color = (0, 255, 255)
         else:
             status_msg = "Navigation Mode - Press ENTER to edit"
             status_color = (100, 100, 255)
@@ -1040,11 +1340,21 @@ class UIManager:
             True if key was handled, False otherwise
         """
         if self.editing_mode:
-            # Editing mode - capture number input
+            # Editing mode - capture number input (only for numeric parameters)
+            param_name = self.param_names[self.selected_param]
+            is_boolean = self.is_boolean_param(param_name)
+            
+            if is_boolean:
+                # Boolean parameters shouldn't be in editing mode, toggle instead
+                self.editing_mode = False
+                self.edit_buffer = ""
+                current_value = self.get_param_value(param_name)
+                self.set_param_value(param_name, not current_value)
+                return True
+            
             if key == 13:  # ENTER - confirm edit
                 try:
                     value = float(self.edit_buffer)
-                    param_name = self.param_names[self.selected_param]
                     self.set_param_value(param_name, value)
                     print(f"[PARAM] {param_name} set to {value:.3f}")
                 except ValueError:
@@ -1072,13 +1382,22 @@ class UIManager:
             elif key == 84 or key == 1 or key == ord('s'):  # DOWN arrow or 's'
                 self.selected_param = (self.selected_param + 1) % len(self.param_names)
                 return True
-            elif key == 13:  # ENTER - start editing
+            elif key == 13:  # ENTER - start editing or toggle
                 param_name = self.param_names[self.selected_param]
-                current_value = self.get_param_value(param_name)
-                self.edit_buffer = f"{current_value:.3f}"
-                self.editing_mode = True
-                print(f"[PARAM] Editing {param_name} (current: {current_value:.3f})")
-                return True
+                is_boolean = self.is_boolean_param(param_name)
+                
+                if is_boolean:
+                    # Toggle boolean parameter
+                    current_value = self.get_param_value(param_name)
+                    self.set_param_value(param_name, not current_value)
+                    return True
+                else:
+                    # Start editing numeric parameter
+                    current_value = self.get_param_value(param_name)
+                    self.edit_buffer = f"{current_value:.3f}"
+                    self.editing_mode = True
+                    print(f"[PARAM] Editing {param_name} (current: {current_value:.3f})")
+                    return True
         
         return False
     
@@ -1095,6 +1414,7 @@ class UIManager:
         if frame is None:
             return None
         
+        # Copy frame for overlay (required to avoid modifying original)
         overlay = frame.copy()
         h, w = overlay.shape[:2]
         
@@ -1108,7 +1428,7 @@ class UIManager:
         cv2.putText(overlay, "Origin", (center_x + 10, center_y - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-        # Draw coordinate axes if calibrated
+        # Draw coordinate axes if calibrated (simplified - no tick marks for performance)
         if self.has_calibration:
             axis_length = 80
             # X-axis (red)
@@ -1125,40 +1445,7 @@ class UIManager:
             cv2.putText(overlay, "Y", (y_end[0] + 5, y_end[1]),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            # Draw tick marks along axes to show scale (every 5cm)
-            tick_interval_m = 0.05  # 5cm ticks
-            tick_length = 8
-            max_distance_m = self.plate_radius_m
-            
-            # X-axis tick marks
-            for sign in [1, -1]:
-                distance_m = tick_interval_m
-                while distance_m <= max_distance_m:
-                    tick_px_along_axis = distance_m / self.pixel_to_meter_ratio
-                    tick_center = (int(center_x + sign * self.x_axis[0] * tick_px_along_axis),
-                                  int(center_y + sign * self.x_axis[1] * tick_px_along_axis))
-                    # Perpendicular to x_axis is y_axis
-                    tick_start = (int(tick_center[0] - self.y_axis[0] * tick_length),
-                                 int(tick_center[1] - self.y_axis[1] * tick_length))
-                    tick_end = (int(tick_center[0] + self.y_axis[0] * tick_length),
-                               int(tick_center[1] + self.y_axis[1] * tick_length))
-                    cv2.line(overlay, tick_start, tick_end, (0, 0, 200), 1)
-                    distance_m += tick_interval_m
-            
-            # Y-axis tick marks
-            for sign in [1, -1]:
-                distance_m = tick_interval_m
-                while distance_m <= max_distance_m:
-                    tick_px_along_axis = distance_m / self.pixel_to_meter_ratio
-                    tick_center = (int(center_x + sign * self.y_axis[0] * tick_px_along_axis),
-                                  int(center_y + sign * self.y_axis[1] * tick_px_along_axis))
-                    # Perpendicular to y_axis is x_axis
-                    tick_start = (int(tick_center[0] - self.x_axis[0] * tick_length),
-                                 int(tick_center[1] - self.x_axis[1] * tick_length))
-                    tick_end = (int(tick_center[0] + self.x_axis[0] * tick_length),
-                               int(tick_center[1] + self.x_axis[1] * tick_length))
-                    cv2.line(overlay, tick_start, tick_end, (0, 200, 0), 1)
-                    distance_m += tick_interval_m
+            # Skip tick marks for performance - they're expensive to draw
         
         # Draw target position using calibrated conversion
         target_x_px, target_y_px = self.platform_to_pixel(self.state.x_target, self.state.y_target)
@@ -1332,11 +1619,38 @@ class ControlLoop:
         
         # Live plotter for PID tuning
         self.enable_plotting = enable_plotting
-        if enable_plotting:
+        # Initialize plotter based on initial state (may be overridden by UI toggle)
+        if enable_plotting and state.live_plotting_enabled:
             self.plotter = LivePlotter(window_size=10.0)
             print("[PLOTTER] Live plotting enabled")
         else:
             self.plotter = None
+            if not enable_plotting:
+                print("[PLOTTER] Live plotting disabled (command-line)")
+            else:
+                print("[PLOTTER] Live plotting disabled (UI default)")
+        
+        # CSV logger for data recording
+        self.csv_logger = CSVLogger(runs_dir="Runs")
+        self.csv_start_time = None
+    
+    def set_plotting_enabled(self, enabled: bool):
+        """
+        Enable or disable live plotting dynamically.
+        
+        Args:
+            enabled: True to enable plotting, False to disable
+        """
+        if enabled and self.plotter is None:
+            # Enable plotting - create plotter
+            if self.enable_plotting:  # Only if command-line didn't disable it
+                self.plotter = LivePlotter(window_size=10.0)
+                print("[PLOTTER] Live plotting ENABLED")
+        elif not enabled and self.plotter is not None:
+            # Disable plotting - close and remove plotter
+            self.plotter.close()
+            self.plotter = None
+            print("[PLOTTER] Live plotting DISABLED")
         
     def run(self):
         """Run main control loop."""
@@ -1364,29 +1678,64 @@ class ControlLoop:
             self.normal_controller.reset()
         self.ui_manager.set_reset_callback(reset_pids)
         
+        # Set up callback for plotting toggle
+        def toggle_plotting(enabled: bool):
+            self.set_plotting_enabled(enabled)
+        self.ui_manager.set_plotting_callback(toggle_plotting)
+        
         self.state.running = True
         self.state.last_update_time = time.time()
+        self.csv_start_time = time.time()  # For elapsed time calculation
         
         # Initialize filtered setpoint to current target
         self.state.x_target_filtered = self.state.x_target
         self.state.y_target_filtered = self.state.y_target
         
+        # Control loop counters for throttling updates
+        display_counter = 0
+        control_panel_counter = 0
+        
         # Control loop
         while self.state.running and not self.state.emergency_stop:
             loop_start = time.time()
             
-            # Update camera and ball detection
+            # Update camera and ball detection (every iteration - critical for control)
             self.camera_manager.update()
             
-            # Update control panel display
-            self.ui_manager.update_control_panel()
+            # Update control panel display (every 10 iterations to reduce overhead)
+            control_panel_counter += 1
+            if control_panel_counter % 10 == 0:
+                self.ui_manager.update_control_panel()
             
-            # Update PID gains and normal controller parameters
-            self.pid_x.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
-            self.pid_y.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
-            self.normal_controller.set_tilt_gain(self.state.tilt_gain)
-            self.normal_controller.set_max_tilt_angle(self.state.max_tilt_angle)
-            self.normal_controller.set_filter_alpha(self.state.normal_filter_alpha)
+            # Update PID gains and normal controller parameters (only when changed)
+            # Cache previous values to avoid unnecessary updates
+            if not hasattr(self, '_last_Kp'):
+                self._last_Kp = self.state.Kp
+                self._last_Ki = self.state.Ki
+                self._last_Kd = self.state.Kd
+                self._last_tilt_gain = self.state.tilt_gain
+                self._last_max_tilt = self.state.max_tilt_angle
+                self._last_filter_alpha = self.state.normal_filter_alpha
+            
+            if (self._last_Kp != self.state.Kp or self._last_Ki != self.state.Ki or 
+                self._last_Kd != self.state.Kd):
+                self.pid_x.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
+                self.pid_y.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
+                self._last_Kp = self.state.Kp
+                self._last_Ki = self.state.Ki
+                self._last_Kd = self.state.Kd
+            
+            if self._last_tilt_gain != self.state.tilt_gain:
+                self.normal_controller.set_tilt_gain(self.state.tilt_gain)
+                self._last_tilt_gain = self.state.tilt_gain
+            
+            if self._last_max_tilt != self.state.max_tilt_angle:
+                self.normal_controller.set_max_tilt_angle(self.state.max_tilt_angle)
+                self._last_max_tilt = self.state.max_tilt_angle
+            
+            if self._last_filter_alpha != self.state.normal_filter_alpha:
+                self.normal_controller.set_filter_alpha(self.state.normal_filter_alpha)
+                self._last_filter_alpha = self.state.normal_filter_alpha
             
             # Get ball position
             ball_pos = self.camera_manager.get_ball_position()
@@ -1439,8 +1788,8 @@ class ControlLoop:
                     ux = self.pid_x.update(ex, x, dt)
                     uy = self.pid_y.update(ey, y, dt)
                 
-                # Add data to live plotter
-                if self.plotter is not None:
+                # Add data to live plotter (only if enabled in state)
+                if self.state.live_plotting_enabled and self.plotter is not None:
                     self.plotter.add_data(
                         x_pos=x,
                         y_pos=y,
@@ -1459,21 +1808,65 @@ class ControlLoop:
                 
                 # Send to hardware via Arduino servo controller
                 self.servo_controller.set_normal(n[0], n[1], n[2])
+            else:
+                # Ball not detected - set default values for logging
+                x, y = None, None
+                ex = 0.0  # No error calculation when ball not detected
+                ey = 0.0
+                ux = 0.0
+                uy = 0.0
+                self.state.ball_is_centered = False
             
-            # Update live plot periodically (every 5 iterations to reduce CPU load)
-            if self.plotter is not None:
+            # Log measured values to CSV (every iteration, efficient - no derived calculations)
+            time_elapsed = current_time - self.csv_start_time
+            n = self.state.current_normal
+            self.csv_logger.log_measured(
+                time_abs=current_time,
+                time_elapsed=time_elapsed,
+                x_pos=x,
+                y_pos=y,
+                x_target=self.state.x_target,
+                y_target=self.state.y_target,
+                x_target_filtered=self.state.x_target_filtered,
+                y_target_filtered=self.state.y_target_filtered,
+                x_error=ex,
+                y_error=ey,
+                x_output=ux,
+                y_output=uy,
+                normal_x=n[0],
+                normal_y=n[1],
+                normal_z=n[2],
+                Kp=self.state.Kp,
+                Ki=self.state.Ki,
+                Kd=self.state.Kd,
+                tilt_gain=self.state.tilt_gain,
+                max_tilt_angle=self.state.max_tilt_angle,
+                centered_tolerance=self.state.centered_tolerance,
+                ball_detected=(ball_pos is not None),
+                ball_centered=self.state.ball_is_centered,
+                pid_x_integral=self.pid_x.integral,
+                pid_y_integral=self.pid_y.integral,
+                pid_x_prev_error=self.pid_x.prev_error,
+                pid_y_prev_error=self.pid_y.prev_error
+            )
+            
+            # Update live plot periodically (every 30 iterations to reduce CPU load)
+            # Only update if plotting is enabled in state
+            if self.state.live_plotting_enabled and self.plotter is not None:
                 if not hasattr(self, '_plot_counter'):
                     self._plot_counter = 0
                 self._plot_counter += 1
-                if self._plot_counter % 5 == 0:
+                if self._plot_counter % 30 == 0:  # Reduced from 5 to 30
                     self.plotter.update_plot()
             
-            # Update display
-            frame = self.camera_manager.get_camera_frame()
-            if frame is not None:
-                overlay = self.ui_manager.draw_overlay(frame)
-                if overlay is not None:
-                    cv2.imshow(self.ui_manager.window_name, overlay)
+            # Update display (every 2 iterations to reduce overhead)
+            display_counter += 1
+            if display_counter % 2 == 0:
+                frame = self.camera_manager.get_camera_frame()
+                if frame is not None:
+                    overlay = self.ui_manager.draw_overlay(frame)
+                    if overlay is not None:
+                        cv2.imshow(self.ui_manager.window_name, overlay)
             
             # Handle keyboard input (non-blocking)
             key = cv2.waitKey(1) & 0xFF
@@ -1495,6 +1888,11 @@ class ControlLoop:
         # Cleanup: set platform to flat
         print("[CLEANUP] Setting platform to flat")
         self.servo_controller.set_normal(0.0, 0.0, 1.0)
+        
+        # Finalize CSV log (calculate derived values)
+        print("[CLEANUP] Finalizing CSV log...")
+        self.csv_logger.finalize()
+        
         self.camera_manager.close()
         if self.plotter is not None:
             self.plotter.close()
@@ -1578,6 +1976,9 @@ Examples:
         print("\n[STOP] Interrupted by user")
         state.emergency_stop = True
         servo_controller.set_normal(0.0, 0.0, 1.0)
+        # Finalize CSV log before cleanup
+        if hasattr(control_loop, 'csv_logger'):
+            control_loop.csv_logger.finalize()
         camera_manager.close()
         servo_controller.close()
     except Exception as e:
@@ -1585,6 +1986,9 @@ Examples:
         import traceback
         traceback.print_exc()
         servo_controller.set_normal(0.0, 0.0, 1.0)
+        # Finalize CSV log before cleanup
+        if hasattr(control_loop, 'csv_logger'):
+            control_loop.csv_logger.finalize()
         camera_manager.close()
         servo_controller.close()
 
