@@ -5,19 +5,18 @@ Real-time 2D PID control for ball balancing on a 3-motor Stewart platform.
 
 This controller integrates:
 - Ball detection (BallDetector from ball_detection.py) for real-time vision
-- Advanced PID control for X and Y axes with live tuning
+- Simple PID control for X and Y axes with live tuning
 - Normal vector computation from PID outputs
 - Arduino servo control (based on arduino_controller.py)
 - Inverse kinematics (from inverseKinematics.py) for servo angle calculation
+- Live plotting for PID tuning visualization (last 10 seconds)
 
-Advanced Control Features:
-- Back-calculation anti-windup: Prevents integral windup with proper feedback
-- Derivative-on-error: Low-pass filtered d(error)/dt for better setpoint tracking
-- Velocity estimation: Exponential moving average for smooth velocity feedback
+Control Features:
 - Rate-limited setpoints: Smooth reference changes to prevent control spikes
 - Filtered normal vector: First-order smoothing on platform tilt commands
 - Trigonometric normal mapping: Proper sin/cos geometry for accurate tilt control
 - Auto-reset on parameter changes: Clears accumulated errors when tuning
+- Real-time plotting: Visualize position, error, and control output for tuning
 
 Features:
 - Reads ball position (x, y) in meters from camera with calibration
@@ -27,6 +26,7 @@ Features:
 - Allows target selection via mouse clicks on camera feed
 - Sends computed servo angles to Arduino hardware
 - Non-blocking serial communication for minimal latency
+- Live plots showing position, error, and PID output (10-second window)
 
 Hardware Interface:
 - Connects to Arduino via serial (auto-detects port)
@@ -34,7 +34,9 @@ Hardware Interface:
 - Falls back to simulation mode if Arduino not connected
 
 Usage:
-    python PID_3d.py
+    python PID_3d.py                     # Run with live plotting
+    python PID_3d.py --no-plot           # Run without plotting (lower CPU usage)
+    python PID_3d.py cal/camera_calib.npz  # Run with camera calibration
     
 Controls:
     - Click on camera window to set target position
@@ -42,40 +44,268 @@ Controls:
     - ENTER to edit selected parameter, type value and ENTER to confirm
     - Press 'q' to quit, 'r' to manually reset PID integrals
     - PID automatically resets when Kp/Ki/Kd/TiltGain changed
+    - Live plot updates automatically every 5 iterations
 """
 
 import cv2
 import numpy as np
 import time
-import sys
 import argparse
 import serial
 import serial.tools.list_ports
 from typing import Optional, Tuple
 from collections import deque
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 # Import ball detection and inverse kinematics
 from ball_detection import BallDetector
 from inverseKinematics import StewartPlatform
 
 
+class LivePlotter:
+    """
+    Real-time plotter for PID tuning visualization.
+    Plots magnitude of position/error and 2D control vector for last 10 seconds.
+    """
+    
+    def __init__(self, window_size: float = 10.0):
+        """
+        Initialize live plotter.
+        
+        Args:
+            window_size: Time window to display in seconds (default: 10.0)
+        """
+        self.window_size = window_size
+        
+        # Data buffers (deques for efficient append/pop)
+        self.times = deque(maxlen=1000)
+        self.x_positions = deque(maxlen=1000)
+        self.y_positions = deque(maxlen=1000)
+        self.x_errors = deque(maxlen=1000)
+        self.y_errors = deque(maxlen=1000)
+        self.x_outputs = deque(maxlen=1000)
+        self.y_outputs = deque(maxlen=1000)
+        self.x_targets = deque(maxlen=1000)
+        self.y_targets = deque(maxlen=1000)
+        
+        # Start time reference
+        self.start_time = time.time()
+        
+        # Setup matplotlib for non-blocking interactive plotting
+        plt.ion()
+        self.fig = plt.figure(figsize=(14, 8))
+        self.fig.canvas.manager.set_window_title('PID Tuning Live Plot')
+        
+        # Create grid layout: 2 rows, 3 columns
+        gs = self.fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+        
+        # Row 0: Distance from target (magnitude)
+        self.ax_distance = self.fig.add_subplot(gs[0, 0])
+        self.ax_distance.set_title('Distance from Target', fontweight='bold')
+        self.ax_distance.set_xlabel('Time (s)')
+        self.ax_distance.set_ylabel('Distance (m)')
+        self.ax_distance.grid(True, alpha=0.3)
+        
+        # Row 0: Error magnitude over time
+        self.ax_error = self.fig.add_subplot(gs[0, 1])
+        self.ax_error.set_title('Error Magnitude', fontweight='bold')
+        self.ax_error.set_xlabel('Time (s)')
+        self.ax_error.set_ylabel('Error (m)')
+        self.ax_error.grid(True, alpha=0.3)
+        
+        # Row 0: Control effort magnitude
+        self.ax_control_mag = self.fig.add_subplot(gs[0, 2])
+        self.ax_control_mag.set_title('Control Effort', fontweight='bold')
+        self.ax_control_mag.set_xlabel('Time (s)')
+        self.ax_control_mag.set_ylabel('Output Magnitude')
+        self.ax_control_mag.grid(True, alpha=0.3)
+        
+        # Row 1: 2D Position trajectory (bird's eye view)
+        self.ax_trajectory = self.fig.add_subplot(gs[1, 0])
+        self.ax_trajectory.set_title('Ball Trajectory (XY)', fontweight='bold')
+        self.ax_trajectory.set_xlabel('X Position (m)')
+        self.ax_trajectory.set_ylabel('Y Position (m)')
+        self.ax_trajectory.grid(True, alpha=0.3)
+        self.ax_trajectory.set_aspect('equal', adjustable='box')
+        
+        # Row 1: Control vector field (quiver plot showing recent control directions)
+        self.ax_control_vector = self.fig.add_subplot(gs[1, 1])
+        self.ax_control_vector.set_title('Control Vector History', fontweight='bold')
+        self.ax_control_vector.set_xlabel('X Output')
+        self.ax_control_vector.set_ylabel('Y Output')
+        self.ax_control_vector.grid(True, alpha=0.3)
+        self.ax_control_vector.axhline(0, color='k', linewidth=0.5)
+        self.ax_control_vector.axvline(0, color='k', linewidth=0.5)
+        self.ax_control_vector.set_aspect('equal', adjustable='box')
+        
+        # Row 1: Component breakdown (X vs Y outputs stacked)
+        self.ax_components = self.fig.add_subplot(gs[1, 2])
+        self.ax_components.set_title('Control Components', fontweight='bold')
+        self.ax_components.set_xlabel('Time (s)')
+        self.ax_components.set_ylabel('Output')
+        self.ax_components.grid(True, alpha=0.3)
+        
+        # Initialize line objects
+        self.lines = {}
+        self.lines['distance'], = self.ax_distance.plot([], [], 'b-', linewidth=2, label='Distance')
+        self.lines['error'], = self.ax_error.plot([], [], 'r-', linewidth=2, label='Error')
+        self.lines['control_mag'], = self.ax_control_mag.plot([], [], 'm-', linewidth=2, label='Magnitude')
+        
+        # Trajectory lines
+        self.lines['trajectory'], = self.ax_trajectory.plot([], [], 'b-', linewidth=1.5, alpha=0.6, label='Path')
+        self.lines['current_pos'] = self.ax_trajectory.scatter([], [], c='blue', s=100, marker='o', label='Current', zorder=5)
+        self.lines['target_pos'] = self.ax_trajectory.scatter([], [], c='green', s=150, marker='*', label='Target', zorder=5)
+        self.ax_trajectory.legend(loc='upper right', fontsize=8)
+        
+        # Control vector scatter (color-coded by time)
+        self.control_scatter = self.ax_control_vector.scatter([], [], c=[], cmap='viridis', s=30, alpha=0.6)
+        
+        # Component lines
+        self.lines['x_output'], = self.ax_components.plot([], [], 'r-', linewidth=1.5, alpha=0.7, label='X Output')
+        self.lines['y_output'], = self.ax_components.plot([], [], 'g-', linewidth=1.5, alpha=0.7, label='Y Output')
+        self.ax_components.legend(loc='upper right', fontsize=8)
+        
+        plt.show(block=False)
+        
+    def add_data(self, x_pos: float, y_pos: float, x_target: float, y_target: float,
+                 x_error: float, y_error: float, x_output: float, y_output: float):
+        """
+        Add new data point to the plot.
+        
+        Args:
+            x_pos: Current x position (m)
+            y_pos: Current y position (m)
+            x_target: Target x position (m)
+            y_target: Target y position (m)
+            x_error: X-axis error (m)
+            y_error: Y-axis error (m)
+            x_output: X-axis PID output
+            y_output: Y-axis PID output
+        """
+        current_time = time.time() - self.start_time
+        
+        # Add data to buffers
+        self.times.append(current_time)
+        self.x_positions.append(x_pos)
+        self.y_positions.append(y_pos)
+        self.x_targets.append(x_target)
+        self.y_targets.append(y_target)
+        self.x_errors.append(x_error)
+        self.y_errors.append(y_error)
+        self.x_outputs.append(x_output)
+        self.y_outputs.append(y_output)
+        
+    def update_plot(self):
+        """Update the plot with current data (non-blocking)."""
+        if len(self.times) < 2:
+            return
+        
+        # Convert deques to numpy arrays for plotting
+        times_array = np.array(self.times)
+        x_pos_array = np.array(self.x_positions)
+        y_pos_array = np.array(self.y_positions)
+        x_target_array = np.array(self.x_targets)
+        y_target_array = np.array(self.y_targets)
+        x_error_array = np.array(self.x_errors)
+        y_error_array = np.array(self.y_errors)
+        x_output_array = np.array(self.x_outputs)
+        y_output_array = np.array(self.y_outputs)
+        
+        # Filter data to only show last window_size seconds
+        current_time = times_array[-1]
+        mask = times_array >= (current_time - self.window_size)
+        
+        times_windowed = times_array[mask]
+        x_pos_windowed = x_pos_array[mask]
+        y_pos_windowed = y_pos_array[mask]
+        x_target_windowed = x_target_array[mask]
+        y_target_windowed = y_target_array[mask]
+        x_error_windowed = x_error_array[mask]
+        y_error_windowed = y_error_array[mask]
+        x_output_windowed = x_output_array[mask]
+        y_output_windowed = y_output_array[mask]
+        
+        # Calculate magnitudes
+        distance_from_target = np.sqrt(x_pos_windowed**2 + y_pos_windowed**2)
+        error_magnitude = np.sqrt(x_error_windowed**2 + y_error_windowed**2)
+        control_magnitude = np.sqrt(x_output_windowed**2 + y_output_windowed**2)
+        
+        # Update magnitude plots
+        self.lines['distance'].set_data(times_windowed, distance_from_target)
+        self.lines['error'].set_data(times_windowed, error_magnitude)
+        self.lines['control_mag'].set_data(times_windowed, control_magnitude)
+        
+        # Update trajectory plot (2D bird's eye view)
+        self.lines['trajectory'].set_data(x_pos_windowed, y_pos_windowed)
+        if len(x_pos_windowed) > 0:
+            self.lines['current_pos'].set_offsets([[x_pos_windowed[-1], y_pos_windowed[-1]]])
+            self.lines['target_pos'].set_offsets([[x_target_windowed[-1], y_target_windowed[-1]]])
+        
+        # Update control vector scatter (show recent control directions)
+        if len(x_output_windowed) > 0:
+            # Create color array based on time (newer = brighter)
+            colors = times_windowed - times_windowed[0]  # Normalize to start at 0
+            self.control_scatter.set_offsets(np.c_[x_output_windowed, y_output_windowed])
+            self.control_scatter.set_array(colors)
+        
+        # Update component breakdown
+        self.lines['x_output'].set_data(times_windowed, x_output_windowed)
+        self.lines['y_output'].set_data(times_windowed, y_output_windowed)
+        
+        # Auto-scale axes with padding
+        self.ax_distance.relim()
+        self.ax_distance.autoscale_view()
+        self.ax_distance.set_xlim(current_time - self.window_size, current_time)
+        
+        self.ax_error.relim()
+        self.ax_error.autoscale_view()
+        self.ax_error.set_xlim(current_time - self.window_size, current_time)
+        
+        self.ax_control_mag.relim()
+        self.ax_control_mag.autoscale_view()
+        self.ax_control_mag.set_xlim(current_time - self.window_size, current_time)
+        
+        self.ax_components.relim()
+        self.ax_components.autoscale_view()
+        self.ax_components.set_xlim(current_time - self.window_size, current_time)
+        
+        # Trajectory plot: auto-scale with some padding
+        if len(x_pos_windowed) > 0:
+            x_range = [min(np.min(x_pos_windowed), np.min(x_target_windowed)), 
+                      max(np.max(x_pos_windowed), np.max(x_target_windowed))]
+            y_range = [min(np.min(y_pos_windowed), np.min(y_target_windowed)), 
+                      max(np.max(y_pos_windowed), np.max(y_target_windowed))]
+            
+            x_padding = (x_range[1] - x_range[0]) * 0.1 or 0.01
+            y_padding = (y_range[1] - y_range[0]) * 0.1 or 0.01
+            
+            self.ax_trajectory.set_xlim(x_range[0] - x_padding, x_range[1] + x_padding)
+            self.ax_trajectory.set_ylim(y_range[0] - y_padding, y_range[1] + y_padding)
+        
+        # Control vector plot: auto-scale with padding
+        if len(x_output_windowed) > 0:
+            output_range = max(np.max(np.abs(x_output_windowed)), np.max(np.abs(y_output_windowed)))
+            if output_range > 0:
+                self.ax_control_vector.set_xlim(-output_range * 1.1, output_range * 1.1)
+                self.ax_control_vector.set_ylim(-output_range * 1.1, output_range * 1.1)
+        
+        # Redraw
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        
+    def close(self):
+        """Close the plot window."""
+        plt.close(self.fig)
+
+
 class PIDController:
     """
-    Advanced PID controller with enhanced anti-windup and derivative filtering.
-    
-    Features:
-    - Back-calculation anti-windup: Integrator corrected by K_aw * (clamped - raw)
-    - Derivative-on-error: Low-pass filtered d(error)/dt for better setpoint tracking
-    - Numerical stability: Prevents division by zero, handles edge cases
-    - Velocity estimation: Exponential moving average of measurement derivative
-    - Epsilon deadband: Prevents integral accumulation for very small errors
+    Simple PID controller.
     """
     
     def __init__(self, Kp: float = 1.0, Ki: float = 0.0, Kd: float = 0.0,
-                 output_limit: float = 1.0, derivative_alpha: float = 0.3,
-                 anti_windup_gain: float = 1.0, velocity_alpha: float = 0.2,
-                 integral_epsilon: float = 0.001,
-                 integral_limit: float = np.inf):
+                 output_limit: float = 1.0):
         """
         Initialize PID controller.
         
@@ -84,42 +314,23 @@ class PIDController:
             Ki: Integral gain
             Kd: Derivative gain
             output_limit: Maximum absolute value for PID output (saturation)
-            derivative_alpha: Low-pass filter coefficient for derivative (0-1, higher = less filtering)
-                            Typical values: 0.2 = heavy filtering, 0.4 = moderate, 0.6 = light
-            anti_windup_gain: Back-calculation anti-windup gain (typically 1.0)
-            velocity_alpha: Exponential moving average coefficient for velocity estimation
-            integral_epsilon: Deadband threshold for integral accumulation (meters)
-                            Integral only accumulates when abs(error) >= epsilon
-                            Prevents micro-oscillations from causing jerky behavior
-                            Typical values: 0.0005-0.002 m (0.5-2 mm)
         """
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
-        
         self.output_limit = output_limit
-        self.derivative_alpha = derivative_alpha
-        self.anti_windup_gain = anti_windup_gain
-        self.velocity_alpha = velocity_alpha
-        self.integral_epsilon = integral_epsilon
-        self.integral_limit = integral_limit
         
         # Internal state
         self.integral = 0.0
         self.prev_error = 0.0
-        self.prev_measurement = 0.0
-        self.filtered_derivative = 0.0
-        self.estimated_velocity = 0.0  # Filtered velocity estimate
-        self.last_saturated = False
-        self.pause_integral = False  # External pause flag (e.g., during bias estimation)
         
-    def update(self, error: float, measurement: float, dt: float, pause_integral: bool = False) -> float:
+    def update(self, error: float, measurement: float, dt: float) -> float:
         """
         Update PID controller and return control output.
         
         Args:
             error: Current error (setpoint - measurement)
-            measurement: Current measurement value
+            measurement: Current measurement value (unused in simple version)
             dt: Time step in seconds
             
         Returns:
@@ -131,76 +342,44 @@ class PIDController:
         # Proportional term
         P = self.Kp * error
         
-        # Integral term with epsilon deadband
-        # Only accumulate integral when error is meaningfully non-zero
-        # This prevents micro-oscillations from causing jerky behavior due to Ki buildup
-        if not pause_integral and abs(error) >= self.integral_epsilon:
-            self.integral += error * dt
-        # If error is within deadband, integral remains unchanged (no accumulation)
-        # Clamp integral to avoid excessive windup
-        if np.isfinite(self.integral_limit):
-            self.integral = float(np.clip(self.integral, -self.integral_limit, self.integral_limit))
-        
+        # Integral term
+        self.integral += error * dt
         I = self.Ki * self.integral
+        # Anti-windup: clamp the integral state so the I term cannot exceed the actuator limits
+        if abs(self.Ki) > 1e-12:
+            integral_limit = abs(self.output_limit) / abs(self.Ki)
+            self.integral = np.clip(self.integral, -integral_limit, integral_limit)
+            I = self.Ki * self.integral
+        else:
+            # Ki is zero (or effectively zero) — ensure no accidental large integral contribution
+            self.integral = 0.0
+            I = 0.0
         
-        # Derivative term with filtering (derivative-on-error)
-        raw_error_derivative = (error - self.prev_error) / dt
+        # Derivative term
+        derivative = (error - self.prev_error) / dt
+        D = self.Kd * derivative
         
-        # Low-pass filter on error derivative to reduce noise
-        self.filtered_derivative = (self.derivative_alpha * raw_error_derivative + 
-                                   (1 - self.derivative_alpha) * self.filtered_derivative)
-        
-        D = self.Kd * self.filtered_derivative
-        
-        # Compute raw output
-        output_raw = P + I + D
+        # Compute output
+        output = P + I + D
         
         # Saturate output
-        output_clamped = np.clip(output_raw, -self.output_limit, self.output_limit)
-        self.last_saturated = bool(abs(output_clamped - output_raw) > 1e-9)
-        
-        # Back-calculation anti-windup: correct integrator based on saturation
-        if self.Ki > 1e-6:  # Only if integral term is active
-            windup_correction = self.anti_windup_gain * (output_clamped - output_raw) / self.Ki
-            self.integral += windup_correction
-        
-        # Update velocity estimator (exponential moving average of measurement derivative)
-        raw_velocity = (measurement - self.prev_measurement) / dt
-        self.estimated_velocity = (self.velocity_alpha * raw_velocity + 
-                                   (1 - self.velocity_alpha) * self.estimated_velocity)
+        output = np.clip(output, -self.output_limit, self.output_limit)
         
         # Update state
         self.prev_error = error
-        self.prev_measurement = measurement
         
-        return output_clamped
-    
-    def get_velocity_estimate(self) -> float:
-        """Get filtered velocity estimate."""
-        return self.estimated_velocity
+        return output
     
     def reset(self):
-        """Reset internal state (integral, derivatives, velocity)."""
+        """Reset internal state."""
         self.integral = 0.0
         self.prev_error = 0.0
-        self.prev_measurement = 0.0
-        self.filtered_derivative = 0.0
-        self.estimated_velocity = 0.0
-        self.last_saturated = False
     
     def set_gains(self, Kp: float, Ki: float, Kd: float):
         """Update PID gains."""
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
-
-    def set_integral_limit(self, limit: float):
-        """Set absolute clamp for the integral accumulator (anti-windup guard)."""
-        self.integral_limit = max(0.0, float(limit)) if np.isfinite(limit) else np.inf
-
-    def is_saturated(self) -> bool:
-        """Return True if the last output was clamped to the output limits."""
-        return self.last_saturated
 
 
 class ControlState:
@@ -213,7 +392,6 @@ class ControlState:
     3. Increase tilt_gain for more aggressive platform movement
     4. Increase Ki carefully to eliminate steady-state error (but causes overshoot)
     5. Increase output_limit in ControlLoop if PID is saturating
-    6. Increase derivative_alpha (0.3-0.5) for faster derivative response
     
     Current settings optimized for: Fast response with moderate stability
     """
@@ -230,14 +408,14 @@ class ControlState:
         
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
-        self.Kp = 0.475  # Proportional gain - increased for faster reaction
-        self.Ki = 0.00   # Integral gain - increased to eliminate steady-state error faster
-        self.Kd = 1.2   # Derivative gain - increased for better damping at higher speeds
+        self.Kp = 0.35  # Proportional gain - increased for faster reaction
+        self.Ki = 0.175   # Integral gain - increased to eliminate steady-state error faster
+        self.Kd = 0.300   # Derivative gain - increased for better damping at higher speeds
         
         # Control parameters
         self.max_tilt_angle = 5.0  # degrees (maximum platform tilt)
-        self.tilt_gain = 0.4  # Scaling factor from PID output to tilt - increased for faster response
-        self.normal_filter_alpha = 0.4  # Smoothing on normal vector (0=no smoothing, 1=instant)
+        self.tilt_gain = 1.0  # Scaling factor from PID output to tilt - increased for faster response
+        self.normal_filter_alpha = 1.0  # Smoothing on normal vector (0=no smoothing, 1=instant)
         
         # Runtime flags
         self.running = False
@@ -249,144 +427,10 @@ class ControlState:
         self.ball_position = None  # (x, y) or None if not detected
         self.ball_is_centered = False  # True if ball is within centered tolerance
         self.last_update_time = None
-
-        # Bias calibration and correction parameters
-        self.bias_enabled = True
-        # Epsilon used for both micro-error deadband and micro-bias ignore
-        self.epsilon = 0.001  # meters
+        
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
         self.centered_tolerance = 0.003  # meters (3mm margin)
-        self.steady_state_time = 1.0  # seconds window for bias detection
-        self.delta_error_threshold = 0.001  # meters (error variation allowed in window)
-        self.derivative_threshold = 0.003  # m/s (|d(error)/dt| below this means steady)
-        self.max_bias_correction_rate = 0.01  # m/s (how fast to apply bias correction)
-        self.bias_decay_rate = 0.2  # 1/s (decay toward zero when not steady)
-        # Filtering and detection robustness for bias estimation
-        self.bias_error_ema_alpha = 0.2  # (0-1) EMA on error for bias detection
-        self.bias_sigma_threshold = 0.0006  # m, allowable std dev in steady window
-        self.bias_min_window_samples = 10  # minimum samples in window to consider
-
-        # Runtime bias state (for UI / diagnostics)
-        self.x_bias_applied = 0.0
-        self.y_bias_applied = 0.0
-        self._last_x_target_for_bias = self.x_target
-        self._last_y_target_for_bias = self.y_target
-
-
-class BiasCalibratorAxis:
-    """Detects and compensates steady-state bias for a single axis.
-
-    Logic:
-    - When error derivative is small and error variation is small over a time window,
-      and the controller is not saturated, and |error| > epsilon, treat as steady-state.
-    - Estimate bias as (measurement - setpoint) and gradually apply a correction with
-      a max rate limit to avoid sudden jumps.
-    - Pause integral accumulation during estimation windows and when micro-bias (< epsilon)
-      would otherwise accumulate.
-    - Decay applied bias toward zero when not in steady state.
-    """
-
-    def __init__(self,
-                 epsilon: float,
-                 steady_state_time: float,
-                 delta_error_threshold: float,
-                 derivative_threshold: float,
-                 max_bias_correction_rate: float,
-                 bias_decay_rate: float,
-                 error_ema_alpha: float = 0.2,
-                 sigma_threshold: float = 0.0006,
-                 min_window_samples: int = 10):
-        self.epsilon = float(epsilon)
-        self.steady_state_time = float(steady_state_time)
-        self.delta_error_threshold = float(delta_error_threshold)
-        self.derivative_threshold = float(derivative_threshold)
-        self.max_bias_correction_rate = float(max_bias_correction_rate)
-        self.bias_decay_rate = float(bias_decay_rate)
-        self.error_ema_alpha = float(np.clip(error_ema_alpha, 0.0, 1.0))
-        self.sigma_threshold = float(sigma_threshold)
-        self.min_window_samples = int(max(1, min_window_samples))
-
-        self.history = deque()  # (timestamp, filtered_error)
-        self.prev_error = 0.0
-        self.error_ema = None
-        self.applied_bias = 0.0
-        self.last_saturated = False
-        self._now = time.time
-
-    def reset(self):
-        self.history.clear()
-        self.prev_error = 0.0
-        self.error_ema = None
-        self.applied_bias = 0.0
-        self.last_saturated = False
-
-    def set_last_saturated(self, saturated: bool):
-        self.last_saturated = bool(saturated)
-
-    def update(self, setpoint: float, measurement: float, dt: float, enabled: bool) -> Tuple[float, bool, bool]:
-        """Update bias estimator.
-
-        Returns: (applied_bias, pause_integral, estimating)
-        """
-        t = self._now()
-        raw_error = setpoint - measurement
-        # EMA filter for error to tolerate jitter
-        if self.error_ema is None:
-            self.error_ema = raw_error
-        self.error_ema = (
-            self.error_ema_alpha * raw_error + (1.0 - self.error_ema_alpha) * self.error_ema
-        )
-        e_filt = self.error_ema
-        # Derivative on filtered error
-        de_dt = (e_filt - self.prev_error) / max(dt, 1e-3)
-        self.prev_error = e_filt
-
-        # Maintain sliding window of errors
-        self.history.append((t, e_filt))
-        # Drop samples older than steady_state_time
-        t_min = t - self.steady_state_time
-        while self.history and self.history[0][0] < t_min:
-            self.history.popleft()
-
-        # Compute error variation over window
-        err_vals = [e for (_, e) in self.history]
-        delta_range = (max(err_vals) - min(err_vals)) if err_vals else float('inf')
-        std_err = float(np.std(err_vals)) if err_vals else float('inf')
-        window_time_ok = (self.history and (self.history[-1][0] - self.history[0][0]) >= self.steady_state_time)
-        window_count_ok = (len(self.history) >= self.min_window_samples)
-        window_ok = window_time_ok and window_count_ok
-
-        # Conditions for steady-state bias detection
-        steady = (
-            enabled and
-            (not self.last_saturated) and
-            abs(de_dt) < self.derivative_threshold and
-            (delta_range < self.delta_error_threshold or std_err < self.sigma_threshold) and
-            abs(e_filt) > self.epsilon and
-            window_ok
-        )
-
-        estimating = False
-        if steady:
-            estimating = True
-            # Estimate bias as measurement - setpoint
-            bias_estimate = measurement - setpoint
-            # Rate-limit change toward estimate
-            delta = bias_estimate - self.applied_bias
-            max_step = self.max_bias_correction_rate * max(dt, 1e-3)
-            step = float(np.clip(delta, -max_step, max_step))
-            self.applied_bias += step
-        else:
-            # Decay bias toward zero when not steady
-            decay = max(0.0, 1.0 - self.bias_decay_rate * max(dt, 1e-3))
-            self.applied_bias *= decay
-
-        # Epsilon interaction: don't apply micro-bias; also pause integral
-        applied_bias = self.applied_bias if abs(self.applied_bias) >= self.epsilon else 0.0
-        pause_integral = estimating or (abs(applied_bias) == 0.0 and abs(e_filt) < self.epsilon)
-
-        return applied_bias, pause_integral, estimating
 
 
 class NormalController:
@@ -405,7 +449,7 @@ class NormalController:
     """
     
     def __init__(self, tilt_gain: float = 0.5, max_tilt_angle_deg: float = 15.0,
-                 filter_alpha: float = 0.4):
+                 filter_alpha: float = 1.0):
         """
         Initialize normal controller.
         
@@ -1151,8 +1195,8 @@ class UIManager:
             
             # Normal vector n = [nx, ny, nz]
             # Tilt direction in platform coordinates is -[nx, ny] (negative because normal tilts opposite to desired motion)
-            tilt_x = -n[0] * tilt_scale
-            tilt_y = -n[1] * tilt_scale
+            tilt_x = n[0] * tilt_scale
+            tilt_y = n[1] * tilt_scale
             
             # Convert tilt vector to pixel coordinates using calibrated axes
             if self.has_calibration:
@@ -1228,26 +1272,6 @@ class UIManager:
         y_offset += 20
         cv2.putText(
             overlay,
-            f"BiasEnabled: {'ON' if self.state.bias_enabled else 'OFF'}",
-            (10, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 255, 200),
-            1,
-        )
-        y_offset += 20
-        cv2.putText(
-            overlay,
-            f"Bias: ({self.state.x_bias_applied:.3f}, {self.state.y_bias_applied:.3f}) m",
-            (10, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 255, 200),
-            1,
-        )
-        y_offset += 20
-        cv2.putText(
-            overlay,
             f"CenterTol: {self.state.centered_tolerance*1000:.1f}mm",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1260,7 +1284,7 @@ class UIManager:
         y_offset = h - 60
         cv2.putText(
             overlay,
-            "Click to set target | 'q' quit | 'r' reset | 'b' bias on/off",
+            "Click to set target | 'q' quit | 'r' reset",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -1278,7 +1302,7 @@ class ControlLoop:
     
     def __init__(self, state: ControlState, camera_manager: CameraManager,
                  normal_controller: NormalController, ui_manager: UIManager,
-                 servo_controller: ArduinoServoController):
+                 servo_controller: ArduinoServoController, enable_plotting: bool = True):
         """
         Initialize control loop.
         
@@ -1288,6 +1312,7 @@ class ControlLoop:
             normal_controller: NormalController instance
             ui_manager: UIManager instance
             servo_controller: ArduinoServoController instance
+            enable_plotting: Enable live plotting for PID tuning (default: True)
         """
         self.state = state
         self.camera_manager = camera_manager
@@ -1298,50 +1323,20 @@ class ControlLoop:
         # PID controllers (same gains for both X and Y)
         self.pid_x = PIDController(
             Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
-            output_limit=20.0,  # Increased output limit for faster response
-            derivative_alpha=0.3,  # Moderate filtering for responsive derivative
-            anti_windup_gain=1.0,  # Back-calculation anti-windup
-            velocity_alpha=0.2,  # Velocity estimation filtering
-            integral_epsilon=self.state.epsilon  # Deadband for integral (prevents micro-oscillation buildup)
+            output_limit=20.0
         )
         self.pid_y = PIDController(
             Kp=state.Kp, Ki=state.Ki, Kd=state.Kd,
-            output_limit=20.0,  # Increased output limit for faster response
-            derivative_alpha=0.3,  # Moderate filtering for responsive derivative
-            anti_windup_gain=1.0,  # Back-calculation anti-windup
-            velocity_alpha=0.2,  # Velocity estimation filtering
-            integral_epsilon=self.state.epsilon  # Deadband for integral (prevents micro-oscillation buildup)
+            output_limit=20.0
         )
-        # Set conservative integral clamp to complement back-calculation anti-windup
-        self.pid_x.set_integral_limit(1.0)
-        self.pid_y.set_integral_limit(1.0)
-
-        # Bias calibrators for X and Y axes
-        self.bias_x = BiasCalibratorAxis(
-            epsilon=self.state.epsilon,
-            steady_state_time=self.state.steady_state_time,
-            delta_error_threshold=self.state.delta_error_threshold,
-            derivative_threshold=self.state.derivative_threshold,
-            max_bias_correction_rate=self.state.max_bias_correction_rate,
-            bias_decay_rate=self.state.bias_decay_rate,
-            error_ema_alpha=self.state.bias_error_ema_alpha,
-            sigma_threshold=self.state.bias_sigma_threshold,
-            min_window_samples=self.state.bias_min_window_samples,
-        )
-        self.bias_y = BiasCalibratorAxis(
-            epsilon=self.state.epsilon,
-            steady_state_time=self.state.steady_state_time,
-            delta_error_threshold=self.state.delta_error_threshold,
-            derivative_threshold=self.state.derivative_threshold,
-            max_bias_correction_rate=self.state.max_bias_correction_rate,
-            bias_decay_rate=self.state.bias_decay_rate,
-            error_ema_alpha=self.state.bias_error_ema_alpha,
-            sigma_threshold=self.state.bias_sigma_threshold,
-            min_window_samples=self.state.bias_min_window_samples,
-        )
-        # Bias estimation debug helpers
-        self._last_bias_estimating = False
-        self._last_bias_print = 0.0
+        
+        # Live plotter for PID tuning
+        self.enable_plotting = enable_plotting
+        if enable_plotting:
+            self.plotter = LivePlotter(window_size=10.0)
+            print("[PLOTTER] Live plotting enabled")
+        else:
+            self.plotter = None
         
     def run(self):
         """Run main control loop."""
@@ -1353,8 +1348,7 @@ class ControlLoop:
         print("  - Use UP/DOWN arrows to select parameter in control panel")
         print("  - Press ENTER to edit selected parameter")
         print("  - Type value and press ENTER to confirm")
-        print("  - Press 'q' to quit, 'r' to reset PID integrals and bias")
-        print("  - Press 'b' to toggle bias compensation ON/OFF")
+        print("  - Press 'q' to quit, 'r' to reset PID integrals")
         print("  - PID integrals auto-reset when Kp/Ki/Kd/TiltGain changed")
         print("="*70)
         
@@ -1368,11 +1362,6 @@ class ControlLoop:
             self.pid_x.reset()
             self.pid_y.reset()
             self.normal_controller.reset()
-            # Also reset bias estimators when core control parameters change
-            self.bias_x.reset()
-            self.bias_y.reset()
-            self.state.x_bias_applied = 0.0
-            self.state.y_bias_applied = 0.0
         self.ui_manager.set_reset_callback(reset_pids)
         
         self.state.running = True
@@ -1425,71 +1414,43 @@ class ControlLoop:
             if abs(dy_target) > max_delta:
                 dy_target = np.sign(dy_target) * max_delta
             self.state.y_target_filtered += dy_target
-            
-            # Reset bias calibrators if target changed significantly
-            if (abs(self.state.x_target - self.state._last_x_target_for_bias) > self.state.epsilon or
-                abs(self.state.y_target - self.state._last_y_target_for_bias) > self.state.epsilon):
-                self.bias_x.reset()
-                self.bias_y.reset()
-                self.state._last_x_target_for_bias = self.state.x_target
-                self.state._last_y_target_for_bias = self.state.y_target
 
             # Control update (only if ball detected)
             if ball_pos is not None:
                 x, y = ball_pos
-                
-                # Bias estimation and compensation
-                bx, pause_ix, estimating_x = self.bias_x.update(
-                    setpoint=self.state.x_target_filtered,
-                    measurement=x,
-                    dt=dt,
-                    enabled=self.state.bias_enabled,
-                )
-                by, pause_iy, estimating_y = self.bias_y.update(
-                    setpoint=self.state.y_target_filtered,
-                    measurement=y,
-                    dt=dt,
-                    enabled=self.state.bias_enabled,
-                )
-                x_corr = x - (bx if self.state.bias_enabled else 0.0)
-                y_corr = y - (by if self.state.bias_enabled else 0.0)
-                self.state.x_bias_applied = (bx if self.state.bias_enabled else 0.0)
-                self.state.y_bias_applied = (by if self.state.bias_enabled else 0.0)
 
-                # Lightweight diagnostic to confirm bias estimator is active
-                estimating_any = estimating_x or estimating_y
-                if estimating_any and (not self._last_bias_estimating) and (current_time - self._last_bias_print > 1.0):
-                    print(f"[BIAS] Estimating... current bias approx (x={bx:+.4f}, y={by:+.4f}) m")
-                    self._last_bias_print = current_time
-                self._last_bias_estimating = estimating_any
-
-                # Compute errors using rate-limited setpoint and corrected measurement
-                ex = self.state.x_target_filtered - x_corr
-                ey = self.state.y_target_filtered - y_corr
+                # Compute errors using rate-limited setpoint
+                ex = self.state.x_target_filtered - x
+                ey = self.state.y_target_filtered - y
                 
                 # Check if ball is within centered tolerance
                 error_magnitude = np.sqrt(ex**2 + ey**2)
                 is_centered = error_magnitude < self.state.centered_tolerance
                 self.state.ball_is_centered = is_centered
                 
-                # Update PID controllers with optional integral pause during bias estimation
-                # If ball is centered (within tolerance), output zero and don't update PID
+                # Update PID controllers
+                # If ball is centered (within tolerance), output zero
                 if is_centered:
-                    # Ball is centered - set outputs to zero and pause integral
+                    # Ball is centered - set outputs to zero
                     ux = 0.0
                     uy = 0.0
-                    # Still update PIDs with pause_integral=True to maintain state tracking
-                    # but ignore the output
-                    _ = self.pid_x.update(ex, x_corr, dt, pause_integral=True)
-                    _ = self.pid_y.update(ey, y_corr, dt, pause_integral=True)
                 else:
                     # Ball is not centered - normal PID control
-                    ux = self.pid_x.update(ex, x_corr, dt, pause_integral=pause_ix)
-                    uy = self.pid_y.update(ey, y_corr, dt, pause_integral=pause_iy)
-
-                # Update calibrators with saturation info for next iteration
-                self.bias_x.set_last_saturated(self.pid_x.is_saturated())
-                self.bias_y.set_last_saturated(self.pid_y.is_saturated())
+                    ux = self.pid_x.update(ex, x, dt)
+                    uy = self.pid_y.update(ey, y, dt)
+                
+                # Add data to live plotter
+                if self.plotter is not None:
+                    self.plotter.add_data(
+                        x_pos=x,
+                        y_pos=y,
+                        x_target=self.state.x_target_filtered,
+                        y_target=self.state.y_target_filtered,
+                        x_error=ex,
+                        y_error=ey,
+                        x_output=ux,
+                        y_output=uy
+                    )
                 
                 # Compute desired normal (includes filtering)
                 n = self.normal_controller.compute_normal(ux, uy)
@@ -1513,10 +1474,17 @@ class ControlLoop:
                         f"[CONTROL] Pos: ({x:+.4f}, {y:+.4f}) m | "
                         f"Error: ({ex:+.4f}, {ey:+.4f}) m{centered_str} | "
                         f"PID: ({ux:+.2f}, {uy:+.2f}) | "
-                        f"Bias: ({self.state.x_bias_applied:+.4f}, {self.state.y_bias_applied:+.4f}) m | "
                         f"Normal: ({n[0]:+.3f}, {n[1]:+.3f}, {n[2]:+.3f}) | "
                         f"Tilt: {tilt_angle:.1f}°"
                     )
+            
+            # Update live plot periodically (every 5 iterations to reduce CPU load)
+            if self.plotter is not None:
+                if not hasattr(self, '_plot_counter'):
+                    self._plot_counter = 0
+                self._plot_counter += 1
+                if self._plot_counter % 5 == 0:
+                    self.plotter.update_plot()
             
             # Update display
             frame = self.camera_manager.get_camera_frame()
@@ -1538,21 +1506,16 @@ class ControlLoop:
                         self.state.emergency_stop = True
                         break
                     elif key == ord('r'):
-                        print("[RESET] Resetting PID integrals and bias")
+                        print("[RESET] Resetting PID integrals")
                         self.pid_x.reset()
                         self.pid_y.reset()
-                        self.bias_x.reset()
-                        self.bias_y.reset()
-                        self.state.x_bias_applied = 0.0
-                        self.state.y_bias_applied = 0.0
-                    elif key == ord('b'):
-                        self.state.bias_enabled = not self.state.bias_enabled
-                        print(f"[BIAS] Bias compensation {'ENABLED' if self.state.bias_enabled else 'DISABLED'}")
         
         # Cleanup: set platform to flat
         print("[CLEANUP] Setting platform to flat")
         self.servo_controller.set_normal(0.0, 0.0, 1.0)
         self.camera_manager.close()
+        if self.plotter is not None:
+            self.plotter.close()
         cv2.destroyAllWindows()
         self.state.running = False
 
@@ -1566,6 +1529,7 @@ def main():
 Examples:
   python PID_3d.py                          # Run without camera calibration
   python PID_3d.py cal/camera_calib.npz      # Run with camera calibration
+  python PID_3d.py --no-plot                # Run without live plotting
         """
     )
     parser.add_argument(
@@ -1573,6 +1537,11 @@ Examples:
         nargs='?',
         default=None,
         help='Path to camera calibration file (.npz). If not provided, camera calibration is disabled.'
+    )
+    parser.add_argument(
+        '--no-plot',
+        action='store_true',
+        help='Disable live plotting (reduces CPU usage)'
     )
     args = parser.parse_args()
     
@@ -1584,6 +1553,11 @@ Examples:
         print(f"[CONFIG] Camera calibration file: {args.calib_file}")
     else:
         print("[CONFIG] Camera calibration: DISABLED")
+    
+    if args.no_plot:
+        print("[CONFIG] Live plotting: DISABLED")
+    else:
+        print("[CONFIG] Live plotting: ENABLED")
     print("="*70)
     
     # Initialize components
@@ -1613,7 +1587,8 @@ Examples:
     )
     
     # Create and run control loop
-    control_loop = ControlLoop(state, camera_manager, normal_controller, ui_manager, servo_controller)
+    control_loop = ControlLoop(state, camera_manager, normal_controller, ui_manager, 
+                               servo_controller, enable_plotting=not args.no_plot)
     
     try:
         control_loop.run()
