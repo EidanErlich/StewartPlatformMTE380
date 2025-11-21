@@ -37,6 +37,7 @@ Usage:
     python PID_3d.py                     # Run with live plotting
     python PID_3d.py --no-plot           # Run without plotting (lower CPU usage)
     python PID_3d.py cal/camera_calib.npz  # Run with camera calibration
+    python PID_3d.py --auto-tune         # Auto-tune PID gains and exit
     
 Controls:
     - Click on camera window to set target position
@@ -57,6 +58,7 @@ from typing import Optional, Tuple
 from collections import deque
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from dataclasses import dataclass
 
 # Import ball detection and inverse kinematics
 from ball_detection import BallDetector
@@ -431,6 +433,239 @@ class ControlState:
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
         self.centered_tolerance = 0.003  # meters (3mm margin)
+
+
+@dataclass
+class AutoTuneResult:
+    """Results from auto-tuning process."""
+    Ku: float  # Ultimate gain
+    Tu: float  # Ultimate period
+    Kp: float  # Tuned proportional gain
+    Ki: float  # Tuned integral gain
+    Kd: float  # Tuned derivative gain
+    tilt_gain: float  # Recommended tilt gain
+    success: bool  # Whether tuning succeeded
+    message: str  # Status message
+
+
+class RelayAutoTuner:
+    """
+    Åström-Hägglund relay feedback auto-tuner for PID gains.
+    
+    This method is safer than Ziegler-Nichols as it uses controlled relay switching
+    instead of pure proportional gain increases. It identifies the ultimate gain (Ku)
+    and ultimate period (Tu) by inducing sustained oscillations through relay feedback.
+    
+    Algorithm:
+    1. Apply relay control: if error > 0, output = +d, else output = -d
+    2. Wait for sustained oscillations (multiple cycles)
+    3. Measure oscillation amplitude (a) and period (Tu)
+    4. Calculate ultimate gain: Ku = 4*d / (π*a)
+    5. Apply Ziegler-Nichols tuning rules:
+       - Kp = 0.6 * Ku
+       - Ki = 1.2 * Ku / Tu
+       - Kd = 0.075 * Ku * Tu
+    """
+    
+    def __init__(self, relay_amplitude: float = 5.0, min_cycles: int = 4, 
+                 timeout: float = 30.0, convergence_threshold: float = 0.15,
+                 hysteresis: float = 0.002):
+        """
+        Initialize relay auto-tuner.
+        
+        Args:
+            relay_amplitude: Amplitude of relay output (d)
+            min_cycles: Minimum number of oscillation cycles to observe
+            timeout: Maximum time to wait for oscillations (seconds)
+            convergence_threshold: Maximum relative variation in period to consider converged
+            hysteresis: Hysteresis band width (meters) to increase switching frequency
+        """
+        self.relay_amplitude = relay_amplitude
+        self.min_cycles = min_cycles
+        self.timeout = timeout
+        self.convergence_threshold = convergence_threshold
+        self.hysteresis = hysteresis
+        
+        # State for tracking oscillations
+        self.error_history = []
+        self.output_history = []
+        self.time_history = []
+        self.zero_crossings = []  # Times when error crosses zero
+        self.peak_values = []  # Peak error magnitudes
+        self.last_output = 0.0  # Track last output for hysteresis
+        
+    def update(self, error: float, current_time: float) -> Tuple[float, bool]:
+        """
+        Update relay controller and return control output.
+        
+        Args:
+            error: Current error (setpoint - measurement)
+            current_time: Current time in seconds
+            
+        Returns:
+            (control_output, is_complete) tuple
+        """
+        # Relay control law with hysteresis for faster switching
+        # Hysteresis prevents chattering and can increase oscillation frequency
+        if error > self.hysteresis:
+            output = self.relay_amplitude
+        elif error < -self.hysteresis:
+            output = -self.relay_amplitude
+        else:
+            # Within hysteresis band - maintain last output
+            output = self.last_output
+        
+        self.last_output = output
+        
+        # Record data
+        self.error_history.append(error)
+        self.output_history.append(output)
+        self.time_history.append(current_time)
+        
+        # Detect zero crossings (sign changes in error)
+        if len(self.error_history) >= 2:
+            prev_error = self.error_history[-2]
+            if prev_error * error < 0:  # Sign change
+                self.zero_crossings.append(current_time)
+                # Record peak value (max absolute error between crossings)
+                if len(self.zero_crossings) >= 2:
+                    start_idx = len(self.time_history) - len(self.error_history)
+                    recent_errors = self.error_history[start_idx:]
+                    peak = max(abs(e) for e in recent_errors)
+                    self.peak_values.append(peak)
+        
+        # Check if we have enough data
+        is_complete = self.check_completion(current_time)
+        
+        return output, is_complete
+    
+    def check_completion(self, current_time: float) -> bool:
+        """Check if we have enough data to compute tuning parameters."""
+        # Need at least min_cycles complete cycles (2 zero crossings per cycle)
+        if len(self.zero_crossings) < 2 * self.min_cycles:
+            return False
+        
+        # Check timeout
+        if len(self.time_history) > 0:
+            elapsed = current_time - self.time_history[0]
+            if elapsed > self.timeout:
+                print("[AUTOTUNE] Timeout reached")
+                return True
+        
+        # Check for convergence: periods should be consistent
+        periods = self.compute_periods()
+        if len(periods) >= self.min_cycles:
+            mean_period = np.mean(periods[-self.min_cycles:])
+            std_period = np.std(periods[-self.min_cycles:])
+            relative_std = std_period / mean_period if mean_period > 0 else float('inf')
+            
+            if relative_std < self.convergence_threshold:
+                print(f"[AUTOTUNE] Convergence achieved (period std: {relative_std:.2%})")
+                return True
+        
+        return False
+    
+    def compute_periods(self) -> list:
+        """Compute oscillation periods from zero crossings."""
+        if len(self.zero_crossings) < 2:
+            return []
+        
+        # Period is time between every other zero crossing (full cycle)
+        periods = []
+        for i in range(0, len(self.zero_crossings) - 2, 2):
+            period = self.zero_crossings[i + 2] - self.zero_crossings[i]
+            periods.append(period)
+        
+        return periods
+    
+    def compute_tuning_parameters(self) -> AutoTuneResult:
+        """
+        Compute PID tuning parameters from collected data.
+        
+        Returns:
+            AutoTuneResult with tuned gains
+        """
+        if len(self.zero_crossings) < 4:
+            return AutoTuneResult(
+                Ku=0, Tu=0, Kp=0, Ki=0, Kd=0, tilt_gain=0,
+                success=False,
+                message="Insufficient oscillation data (need at least 2 complete cycles)"
+            )
+        
+        # Compute ultimate period (Tu): average of recent periods
+        periods = self.compute_periods()
+        if not periods:
+            return AutoTuneResult(
+                Ku=0, Tu=0, Kp=0, Ki=0, Kd=0, tilt_gain=0,
+                success=False,
+                message="Failed to compute oscillation periods"
+            )
+        
+        Tu = np.mean(periods[-self.min_cycles:])
+        
+        # Compute oscillation amplitude (a): average of peak values
+        if len(self.peak_values) < 2:
+            return AutoTuneResult(
+                Ku=0, Tu=0, Kp=0, Ki=0, Kd=0, tilt_gain=0,
+                success=False,
+                message="Failed to detect oscillation amplitude"
+            )
+        
+        a = np.mean(self.peak_values[-self.min_cycles:])
+        
+        # Compute ultimate gain: Ku = 4*d / (π*a)
+        # where d is relay amplitude
+        Ku = (4 * self.relay_amplitude) / (np.pi * a)
+        
+        # Apply Ziegler-Nichols tuning rules (PID variant)
+        Kp = 0.6 * Ku
+        Ki = 1.2 * Ku / Tu
+        Kd = 0.075 * Ku * Tu
+        
+        # Recommend conservative tilt gain (start low, user can increase)
+        tilt_gain = 0.5
+        
+        return AutoTuneResult(
+            Ku=Ku, Tu=Tu, Kp=Kp, Ki=Ki, Kd=Kd, tilt_gain=tilt_gain,
+            success=True,
+            message=f"Auto-tuning successful: Ku={Ku:.2f}, Tu={Tu:.3f}s"
+        )
+    
+    def plot_results(self):
+        """Plot oscillation data for visualization."""
+        if len(self.time_history) < 2:
+            print("[AUTOTUNE] No data to plot")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Plot error over time
+        ax1.plot(self.time_history, self.error_history, 'b-', linewidth=1.5, label='Error')
+        ax1.axhline(0, color='k', linewidth=0.5, linestyle='--')
+        
+        # Mark zero crossings
+        for crossing in self.zero_crossings:
+            ax1.axvline(crossing, color='r', alpha=0.3, linewidth=1)
+        
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel('Error (m)')
+        ax1.set_title('Relay Auto-Tuning: Error Signal')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Plot output over time
+        ax2.plot(self.time_history, self.output_history, 'g-', linewidth=1.5, label='Relay Output')
+        ax2.axhline(0, color='k', linewidth=0.5, linestyle='--')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Output')
+        ax2.set_title('Relay Auto-Tuning: Control Output')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.savefig('autotune_results.png', dpi=150)
+        print("[AUTOTUNE] Results saved to autotune_results.png")
+        plt.show()
 
 
 class NormalController:
@@ -1519,6 +1754,306 @@ class ControlLoop:
         cv2.destroyAllWindows()
         self.state.running = False
 
+
+def run_auto_tune(camera_manager: CameraManager, servo_controller: ArduinoServoController,
+                  axis: str = 'x') -> AutoTuneResult:
+    """
+    Run relay auto-tuning to determine optimal PID gains.
+    
+    Args:
+        camera_manager: CameraManager instance for ball detection
+        servo_controller: ArduinoServoController for hardware control
+        axis: Which axis to tune ('x' or 'y')
+        
+    Returns:
+        AutoTuneResult with tuned parameters
+    """
+
+    servo_controller.set_normal(0.0, 0.0, 1.0)
+
+    print("="*70)
+    print(f"AUTO-TUNING PID CONTROLLER ({axis.upper()}-AXIS)")
+    print("="*70)
+    print("This process will:")
+    print("1. Apply relay feedback control to induce oscillations")
+    print("2. Measure oscillation characteristics (amplitude and period)")
+    print("3. Calculate optimal PID gains using Åström-Hägglund method")
+    print("4. Display results and save plot")
+    print()
+    print("IMPORTANT: Place ball near center of platform before starting!")
+    print("Press any key when ready, or 'q' to cancel...")
+    print("="*70)
+    
+    # Get calibrated platform center from ball detector
+    detector = camera_manager.detector
+    if detector.has_coordinate_frame and detector.origin_px is not None:
+        platform_center_px = tuple(detector.origin_px.astype(int))
+        has_calibration = True
+        x_axis = detector.x_axis
+        y_axis = detector.y_axis
+        pixel_to_meter_ratio = detector.pixel_to_meter_ratio
+    else:
+        # Fallback to frame center if no calibration
+        platform_center_px = None  # Will be set in loop
+        has_calibration = False
+        x_axis = np.array([1.0, 0.0])
+        y_axis = np.array([0.0, -1.0])
+        pixel_to_meter_ratio = None
+    
+    # Wait for user confirmation
+    cv2.namedWindow("Auto-Tune Preview")
+    
+    while True:
+        ret = camera_manager.update()
+        if ret:
+            frame = camera_manager.get_camera_frame()
+            if frame is not None:
+                # Draw simple overlay
+                overlay = frame.copy()
+                h, w = overlay.shape[:2]
+                
+                # Set platform center if not calibrated
+                if not has_calibration and platform_center_px is None:
+                    platform_center_px = (w//2, h//2)
+                    # Estimate pixel to meter ratio if not available
+                    if pixel_to_meter_ratio is None:
+                        plate_radius_m = 0.15
+                        plate_radius_px = min(w, h) * 0.4
+                        pixel_to_meter_ratio = plate_radius_m / plate_radius_px
+                
+                cv2.putText(overlay, "AUTO-TUNE MODE", (w//2 - 150, 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                cv2.putText(overlay, "Place ball near platform center", (w//2 - 220, 100),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(overlay, "Press any key to start, 'q' to cancel", (w//2 - 250, 150),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                
+                # Draw crosshair at calibrated platform center (not window center)
+                cv2.drawMarker(overlay, platform_center_px, (0, 255, 0), 
+                             cv2.MARKER_CROSS, 40, 2)
+                cv2.putText(overlay, "Platform Center", 
+                           (platform_center_px[0] + 15, platform_center_px[1] - 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Draw coordinate axes if calibrated
+                if has_calibration:
+                    axis_length = 80
+                    center_x, center_y = platform_center_px
+                    # X-axis (red)
+                    x_end = (int(center_x + x_axis[0] * axis_length),
+                            int(center_y + x_axis[1] * axis_length))
+                    cv2.arrowedLine(overlay, platform_center_px, x_end, (0, 0, 255), 2, tipLength=0.3)
+                    cv2.putText(overlay, "X", (x_end[0] + 5, x_end[1]),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    
+                    # Y-axis (green)
+                    y_end = (int(center_x + y_axis[0] * axis_length),
+                            int(center_y + y_axis[1] * axis_length))
+                    cv2.arrowedLine(overlay, platform_center_px, y_end, (0, 255, 0), 2, tipLength=0.3)
+                    cv2.putText(overlay, "Y", (y_end[0] + 5, y_end[1]),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                cv2.imshow("Auto-Tune Preview", overlay)
+        
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('q'):
+            print("[AUTOTUNE] Cancelled by user")
+            cv2.destroyAllWindows()
+            return AutoTuneResult(0, 0, 0, 0, 0, 0, False, "Cancelled by user")
+        elif key != 255:
+            break
+    
+    print("[AUTOTUNE] Starting auto-tune sequence...")
+    print("[AUTOTUNE] Waiting for ball detection...")
+    
+    # Wait for ball detection
+    ball_detected = False
+    for _ in range(100):  # Try for ~3 seconds
+        camera_manager.update()
+        if camera_manager.get_ball_position() is not None:
+            ball_detected = True
+            break
+        time.sleep(0.03)
+    
+    if not ball_detected:
+        print("[AUTOTUNE] ERROR: Ball not detected. Place ball on platform and try again.")
+        cv2.destroyAllWindows()
+        return AutoTuneResult(0, 0, 0, 0, 0, 0, False, "Ball not detected")
+    
+    print("[AUTOTUNE] Ball detected. Starting relay feedback...")
+    
+    # Initialize auto-tuner with very conservative parameters for bounded testing
+    # Much smaller amplitude to keep ball well within boundaries
+    tuner = RelayAutoTuner(
+        relay_amplitude=0.08,  # Very small relay amplitude for bounded space
+        min_cycles=8,  # More cycles needed with very small amplitude
+        timeout=60.0,  # Longer timeout for very gentle oscillations
+        convergence_threshold=0.20,  # More lenient convergence for small signals
+        hysteresis=0.0005  # Very small hysteresis (0.5mm) for faster oscillations
+    )
+    
+    # Create simple normal controller for applying tilts
+    # Much reduced tilt gain to keep ball movements very gentle within boundaries
+    normal_controller = NormalController(
+        tilt_gain=0.25,  # Very low tilt gain for minimal ball movement
+        max_tilt_angle_deg=3.0,  # Very low max tilt angle (3 degrees)
+        filter_alpha=0.85  # More filtering for smoother motion
+    )
+    
+    # Target position (center)
+    target = 0.0
+    
+    # Auto-tune loop
+    start_time = time.time()
+    last_update = start_time
+    iteration = 0
+    
+    print("[AUTOTUNE] Running relay feedback control...")
+    print(f"[AUTOTUNE] Tuning {axis.upper()}-axis (other axis held at zero)")
+    
+    while True:
+        current_time = time.time()
+        dt = current_time - last_update
+        last_update = current_time
+        
+        # Update camera
+        camera_manager.update()
+        ball_pos = camera_manager.get_ball_position()
+        
+        if ball_pos is None:
+            print("[AUTOTUNE] WARNING: Lost ball tracking")
+            time.sleep(0.01)
+            continue
+        
+        # Get error for selected axis
+        if axis == 'x':
+            error = target - ball_pos[0]
+        else:
+            error = target - ball_pos[1]
+        
+        # Update tuner and get relay output
+        elapsed = current_time - start_time
+        relay_output, is_complete = tuner.update(error, elapsed)
+        
+        # Apply control output via normal controller
+        if axis == 'x':
+            ux, uy = relay_output, 0.0
+        else:
+            ux, uy = 0.0, relay_output
+        
+        normal = normal_controller.compute_normal(ux, uy)
+        servo_controller.set_normal(normal[0], normal[1], normal[2])
+        
+        # Display progress
+        iteration += 1
+        if iteration % 20 == 0:
+            cycles = len(tuner.zero_crossings) // 2
+            print(f"[AUTOTUNE] Time: {elapsed:.1f}s | Error: {error:+.4f}m | "
+                  f"Output: {relay_output:+.1f} | Cycles: {cycles}/{tuner.min_cycles}")
+        
+        # Update visualization
+        frame = camera_manager.get_camera_frame()
+        if frame is not None:
+            overlay = frame.copy()
+            h, w = overlay.shape[:2]
+            
+            # Status text
+            cv2.putText(overlay, f"AUTO-TUNING {axis.upper()}-AXIS", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(overlay, f"Cycles: {len(tuner.zero_crossings)//2}/{tuner.min_cycles}", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Error: {error:+.4f}m", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Output: {relay_output:+.1f}", (10, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Draw platform center crosshair
+            cv2.drawMarker(overlay, platform_center_px, (0, 255, 255), 
+                         cv2.MARKER_CROSS, 20, 1)
+            
+            # Draw ball position using proper coordinate conversion
+            if has_calibration:
+                # Use calibrated coordinate frame
+                delta_px = (ball_pos[0] / pixel_to_meter_ratio) * x_axis + \
+                          (ball_pos[1] / pixel_to_meter_ratio) * y_axis
+                ball_pixel_pos = detector.origin_px + delta_px
+                ball_px = (int(ball_pixel_pos[0]), int(ball_pixel_pos[1]))
+            else:
+                # Fallback: simple conversion from platform center
+                center_x, center_y = platform_center_px
+                ball_px = (int(center_x + ball_pos[0] / pixel_to_meter_ratio),
+                          int(center_y - ball_pos[1] / pixel_to_meter_ratio))
+            
+            cv2.circle(overlay, ball_px, 10, (0, 255, 0), 2)
+            cv2.putText(overlay, f"Ball: ({ball_pos[0]:.3f}, {ball_pos[1]:.3f})m",
+                       (ball_px[0] + 15, ball_px[1]), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.4, (0, 255, 0), 1)
+            
+            cv2.imshow("Auto-Tune Preview", overlay)
+        
+        # Check for completion or user abort
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("[AUTOTUNE] Aborted by user")
+            break
+        
+        if is_complete:
+            print("[AUTOTUNE] Data collection complete!")
+            break
+        
+        # Prevent tight loop
+        time.sleep(0.01)
+    
+    # Return to neutral position
+    print("[AUTOTUNE] Returning platform to neutral...")
+    servo_controller.set_normal(0.0, 0.0, 1.0)
+    time.sleep(0.5)
+    
+    # Compute tuning parameters
+    print("[AUTOTUNE] Computing PID parameters...")
+    result = tuner.compute_tuning_parameters()
+    
+    # Display results
+    print()
+    print("="*70)
+    print("AUTO-TUNE RESULTS")
+    print("="*70)
+    if result.success:
+        print(f"✓ {result.message}")
+        print()
+        print("System Characteristics:")
+        print(f"  Ultimate Gain (Ku):   {result.Ku:.3f}")
+        print(f"  Ultimate Period (Tu): {result.Tu:.3f} seconds")
+        print()
+        print("Recommended PID Gains (Ziegler-Nichols PID):")
+        print(f"  Kp (Proportional): {result.Kp:.3f}")
+        print(f"  Ki (Integral):     {result.Ki:.3f}")
+        print(f"  Kd (Derivative):   {result.Kd:.3f}")
+        print()
+        print("Recommended Control Parameters:")
+        print(f"  Tilt Gain:         {result.tilt_gain:.2f}")
+        print()
+        print("To use these gains, update your config.json or modify the code:")
+        print(f"  self.Kp = {result.Kp:.3f}")
+        print(f"  self.Ki = {result.Ki:.3f}")
+        print(f"  self.Kd = {result.Kd:.3f}")
+        print(f"  self.tilt_gain = {result.tilt_gain:.2f}")
+        print()
+        print("NOTE: These are starting values. Fine-tune based on performance.")
+        print("      Consider reducing Ki if you see overshoot.")
+        print("      Increase Kd if you need more damping.")
+    else:
+        print(f"✗ Auto-tuning failed: {result.message}")
+    print("="*70)
+    
+    # Plot results
+    print("[AUTOTUNE] Generating visualization...")
+    tuner.plot_results()
+    
+    cv2.destroyAllWindows()
+    return result
+
+
 def main():
     """Main entry point."""
     # Parse command-line arguments
@@ -1530,6 +2065,8 @@ Examples:
   python PID_3d.py                          # Run without camera calibration
   python PID_3d.py cal/camera_calib.npz      # Run with camera calibration
   python PID_3d.py --no-plot                # Run without live plotting
+  python PID_3d.py --auto-tune              # Auto-tune PID gains and exit
+  python PID_3d.py --auto-tune --axis y     # Auto-tune Y-axis only
         """
     )
     parser.add_argument(
@@ -1543,6 +2080,17 @@ Examples:
         action='store_true',
         help='Disable live plotting (reduces CPU usage)'
     )
+    parser.add_argument(
+        '--auto-tune',
+        action='store_true',
+        help='Run auto-tuning to determine optimal PID gains and exit'
+    )
+    parser.add_argument(
+        '--axis',
+        choices=['x', 'y', 'both'],
+        default='both',
+        help='Axis to auto-tune (default: both)'
+    )
     args = parser.parse_args()
     
     print("="*70)
@@ -1554,14 +2102,14 @@ Examples:
     else:
         print("[CONFIG] Camera calibration: DISABLED")
     
-    if args.no_plot:
+    if args.auto_tune:
+        print("[CONFIG] Mode: AUTO-TUNE")
+        print(f"[CONFIG] Tuning axis: {args.axis.upper()}")
+    elif args.no_plot:
         print("[CONFIG] Live plotting: DISABLED")
     else:
         print("[CONFIG] Live plotting: ENABLED")
     print("="*70)
-    
-    # Initialize components
-    state = ControlState()
     
     # Initialize hardware (Arduino servo controller)
     print("[INIT] Connecting to Arduino...")
@@ -1570,6 +2118,59 @@ Examples:
     # Initialize camera and ball detection
     print("[INIT] Initializing camera and ball detector...")
     camera_manager = CameraManager(camera_id=0, calib_file=args.calib_file)
+    
+    # AUTO-TUNE MODE
+    if args.auto_tune:
+        try:
+            if args.axis == 'both':
+                print("\n[AUTOTUNE] Tuning X-axis first...")
+                result_x = run_auto_tune(camera_manager, servo_controller, axis='x')
+                
+                if result_x.success:
+                    print("\n[AUTOTUNE] X-axis tuning complete. Press any key to continue to Y-axis...")
+                    input()
+                    
+                    print("\n[AUTOTUNE] Tuning Y-axis...")
+                    result_y = run_auto_tune(camera_manager, servo_controller, axis='y')
+                    
+                    if result_y.success:
+                        print("\n" + "="*70)
+                        print("COMBINED AUTO-TUNE RESULTS")
+                        print("="*70)
+                        print("X-Axis:")
+                        print(f"  Kp: {result_x.Kp:.3f}  Ki: {result_x.Ki:.3f}  Kd: {result_x.Kd:.3f}")
+                        print("Y-Axis:")
+                        print(f"  Kp: {result_y.Kp:.3f}  Ki: {result_y.Ki:.3f}  Kd: {result_y.Kd:.3f}")
+                        print("\nRecommended (averaged):")
+                        avg_kp = (result_x.Kp + result_y.Kp) / 2
+                        avg_ki = (result_x.Ki + result_y.Ki) / 2
+                        avg_kd = (result_x.Kd + result_y.Kd) / 2
+                        print(f"  Kp: {avg_kp:.3f}")
+                        print(f"  Ki: {avg_ki:.3f}")
+                        print(f"  Kd: {avg_kd:.3f}")
+                        print(f"  Tilt Gain: {result_x.tilt_gain:.2f}")
+                        print("="*70)
+            else:
+                result = run_auto_tune(camera_manager, servo_controller, axis=args.axis)
+                
+        except KeyboardInterrupt:
+            print("\n[AUTOTUNE] Interrupted by user")
+        except Exception as e:
+            print(f"[AUTOTUNE] Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print("[CLEANUP] Returning platform to neutral...")
+            servo_controller.set_normal(0.0, 0.0, 1.0)
+            camera_manager.close()
+            servo_controller.close()
+        
+        print("[AUTOTUNE] Auto-tuning complete. Exiting.")
+        return
+    
+    # NORMAL CONTROL MODE
+    # Initialize components
+    state = ControlState()
     
     # Initialize normal controller
     normal_controller = NormalController(
