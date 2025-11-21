@@ -404,7 +404,7 @@ class ControlState:
         # Rate-limited target position (smooth setpoint changes)
         self.x_target_filtered = 0.0
         self.y_target_filtered = 0.0
-        self.max_target_rate = 2.0  # m/s - maximum rate of setpoint change
+        self.max_target_rate = 5.0  # m/s - maximum rate of setpoint change
         
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
@@ -430,7 +430,7 @@ class ControlState:
         
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
-        self.centered_tolerance = 0.003  # meters (3mm margin)
+        self.centered_tolerance = 0.015  # meters (3mm margin)
 
 
 class NormalController:
@@ -1459,24 +1459,6 @@ class ControlLoop:
                 
                 # Send to hardware via Arduino servo controller
                 self.servo_controller.set_normal(n[0], n[1], n[2])
-                
-                # Print diagnostics (throttled to avoid console spam)
-                # Only print every 10 iterations (~10 Hz instead of 100 Hz)
-                if hasattr(self, '_print_counter'):
-                    self._print_counter += 1
-                else:
-                    self._print_counter = 0
-                
-                if self._print_counter % 10 == 0:
-                    tilt_angle = np.rad2deg(np.arccos(np.clip(n[2], -1.0, 1.0)))
-                    centered_str = " [CENTERED]" if is_centered else ""
-                    print(
-                        f"[CONTROL] Pos: ({x:+.4f}, {y:+.4f}) m | "
-                        f"Error: ({ex:+.4f}, {ey:+.4f}) m{centered_str} | "
-                        f"PID: ({ux:+.2f}, {uy:+.2f}) | "
-                        f"Normal: ({n[0]:+.3f}, {n[1]:+.3f}, {n[2]:+.3f}) | "
-                        f"Tilt: {tilt_angle:.1f}°"
-                    )
             
             # Update live plot periodically (every 5 iterations to reduce CPU load)
             if self.plotter is not None:
