@@ -633,8 +633,9 @@ class TwiddleOptimizer:
         self.params = np.array(initial_params, dtype=float)
         
         # Perturbation vector (how much to change params by initially)
-        # These are relative to typical parameter scales
-        self.d_params = np.array([0.05, 0.01, 0.05], dtype=float)
+        # Adjusted based on analysis: Kd needs more exploration (optimal ~0.30-0.35)
+        # Kd perturbation increased to encourage exploration of higher values
+        self.d_params = np.array([0.05, 0.01, 0.08], dtype=float)  # Increased Kd from 0.05 to 0.08
         
         # Parameter bounds to prevent unsafe values
         self.param_bounds = np.array([
@@ -648,6 +649,13 @@ class TwiddleOptimizer:
         self.current_param_idx = 0
         self.stage = 0  # 0=try positive, 1=try negative
         self.iteration = 0
+        
+        # Exploration enhancement: track consecutive failures to detect local minima
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5  # After 5 consecutive failures, boost exploration
+        self.param_failure_count = [0, 0, 0]  # Track failures per parameter
+        self.iterations_since_improvement = 0  # Track global stagnation
+        self.max_iterations_without_improvement = 20  # After 20 iterations, force exploration
         
     def get_params(self) -> np.ndarray:
         """Get current parameter vector [Kp, Ki, Kd]."""
@@ -671,7 +679,13 @@ class TwiddleOptimizer:
             # Store the parameters that achieved this best cost
             # Note: params are already updated with the perturbation, so they're the best
             self.best_params = self.params.copy()
-            self.d_params[self.current_param_idx] *= 1.1  # Speed up search
+            # Less aggressive growth to prevent overshooting (1.05 instead of 1.1)
+            self.d_params[self.current_param_idx] *= 1.05
+            
+            # Reset failure tracking on success
+            self.consecutive_failures = 0
+            self.param_failure_count[self.current_param_idx] = 0
+            self.iterations_since_improvement = 0
             
             # Move to next parameter
             self.current_param_idx = (self.current_param_idx + 1) % len(self.params)
@@ -681,6 +695,18 @@ class TwiddleOptimizer:
                   f"moving to param {self.current_param_idx}")
         else:
             # No improvement
+            self.consecutive_failures += 1
+            self.param_failure_count[self.current_param_idx] += 1
+            self.iterations_since_improvement += 1
+            
+            # Global stagnation detection: if no improvement for many iterations, boost all step sizes
+            if self.iterations_since_improvement >= self.max_iterations_without_improvement:
+                # Force exploration by increasing all step sizes
+                for i in range(len(self.d_params)):
+                    self.d_params[i] *= 1.3  # Boost all parameters
+                print(f"[TWIDDLE] Global stagnation detected - boosting all step sizes for exploration")
+                self.iterations_since_improvement = 0  # Reset counter
+            
             if self.stage == 0:
                 # Positive perturbation failed, try negative
                 self.params[self.current_param_idx] -= 2 * self.d_params[self.current_param_idx]
@@ -689,7 +715,25 @@ class TwiddleOptimizer:
             else:
                 # Both positive and negative failed, revert and shrink step size
                 self.params[self.current_param_idx] += self.d_params[self.current_param_idx]
-                self.d_params[self.current_param_idx] *= 0.9  # Slow down search
+                
+                # Less aggressive shrinkage to prevent getting stuck (0.95 instead of 0.9)
+                # But if stuck for too long, boost exploration
+                if self.param_failure_count[self.current_param_idx] >= self.max_consecutive_failures:
+                    # Boost exploration: increase step size to escape local minimum
+                    self.d_params[self.current_param_idx] *= 1.2
+                    print(f"[TWIDDLE] Parameter {self.current_param_idx} stuck - boosting exploration "
+                          f"(step size: {self.d_params[self.current_param_idx]:.5f})")
+                    self.param_failure_count[self.current_param_idx] = 0  # Reset counter
+                else:
+                    self.d_params[self.current_param_idx] *= 0.95  # Gentle shrinkage
+                
+                # Special handling for Kd (index 2): encourage higher values
+                # If Kd is low and failing, try a larger positive jump
+                if self.current_param_idx == 2 and self.params[2] < 0.25:
+                    # Kd is below optimal range, encourage exploration upward
+                    if self.d_params[2] < 0.10:
+                        self.d_params[2] = 0.10  # Ensure minimum step size for Kd
+                        print(f"[TWIDDLE] Kd below optimal range - maintaining exploration step size")
                 
                 # Move to next parameter
                 self.current_param_idx = (self.current_param_idx + 1) % len(self.params)
@@ -714,7 +758,17 @@ class TwiddleOptimizer:
             Parameter vector with perturbation applied
         """
         if self.stage == 0:
-            self.params[self.current_param_idx] += self.d_params[self.current_param_idx]
+            perturbation = self.d_params[self.current_param_idx]
+            
+            # Special handling for Kd: bias toward higher values if below optimal range
+            # Analysis shows optimal Kd is 0.30-0.35, so encourage exploration upward
+            if self.current_param_idx == 2 and self.params[2] < 0.28:
+                # Kd is below optimal range - use larger positive perturbation
+                perturbation = max(perturbation, 0.10)  # Ensure at least 0.10 step
+                if self.params[2] < 0.20:
+                    perturbation *= 1.5  # Even larger step if very low
+            
+            self.params[self.current_param_idx] += perturbation
         
         # Clamp to bounds
         for i in range(len(self.params)):
@@ -770,6 +824,8 @@ class AutoTuner:
         
         # Active Recovery state
         self.recovery_start_time = None
+        self.recovery_centered_start_time = None  # When ball first became centered
+        self.recovery_hold_time = 2.0  # seconds - how long ball must stay centered
         self.recovery_timeout = 10.0  # seconds - max time to recover ball
         self.recovery_params = None  # Best-known PID params for recovery
         self.best_params_ever = None  # Store best parameters found so far
@@ -785,7 +841,7 @@ class AutoTuner:
         # Safety limits
         self.max_error_safety = 0.15  # meters - abort if error exceeds this
         self.max_tilt_safety = 10.0  # degrees - abort if tilt exceeds this
-        self.recovery_centered_threshold = 0.02  # meters - ball must be within 2cm to consider recovered
+        self.recovery_centered_threshold = 0.05  # meters - ball must be within 2cm to consider recovered
         
         # Cost function weights
         self.error_weight = 1.0  # Weight for ITAE term
@@ -957,6 +1013,7 @@ class AutoTuner:
         # Enter recovery phase
         self.episode_phase = "RECOVERING"
         self.recovery_start_time = time.time()
+        self.recovery_centered_start_time = None  # Reset centered tracking
     
     def update(self, error_x: float, error_y: float, 
                control_x: float, control_y: float, 
@@ -1006,13 +1063,25 @@ class AutoTuner:
             
             # Check if ball is within recovery threshold
             if error_magnitude < self.recovery_centered_threshold:
-                # Ball is centered! Recovery successful
-                print(f"[AUTOTUNER] RECOVERY SUCCESS: Ball centered after {recovery_elapsed:.2f}s")
-                # Wait a bit more to ensure stability
-                if recovery_elapsed > 1.0:  # At least 1 second of being centered
+                # Ball is currently centered
+                if self.recovery_centered_start_time is None:
+                    # Ball just became centered - start tracking
+                    self.recovery_centered_start_time = current_time
+                
+                # Check how long ball has been continuously centered
+                centered_duration = current_time - self.recovery_centered_start_time
+                
+                # Ball must stay centered for the full hold time
+                if centered_duration >= self.recovery_hold_time:
+                    print(f"[AUTOTUNER] RECOVERY SUCCESS: Ball centered and stable for {centered_duration:.2f}s "
+                          f"(total recovery time: {recovery_elapsed:.2f}s)")
                     self.start_episode()
                 return
             else:
+                # Ball is not centered - reset the centered start time
+                if self.recovery_centered_start_time is not None:
+                    self.recovery_centered_start_time = None
+                
                 # Still recovering - check timeout
                 if recovery_elapsed > self.recovery_timeout:
                     print(f"[AUTOTUNER] RECOVERY FAILED: Ball not centered after {self.recovery_timeout:.1f}s")
@@ -1131,8 +1200,14 @@ class AutoTuner:
         # Calculate time elapsed based on current phase
         if self.episode_phase == "RECOVERING" and self.recovery_start_time:
             recovery_time = time.time() - self.recovery_start_time
+            # Calculate how long ball has been continuously centered
+            if self.recovery_centered_start_time:
+                centered_duration = time.time() - self.recovery_centered_start_time
+            else:
+                centered_duration = 0.0
         else:
             recovery_time = 0.0
+            centered_duration = 0.0
         
         return {
             'is_tuning': True,
@@ -1140,6 +1215,8 @@ class AutoTuner:
             'episode': self.episode_count,
             'time_elapsed': self.time_elapsed if self.episode_start_time else 0.0,
             'recovery_time': recovery_time,
+            'recovery_centered_duration': centered_duration,
+            'recovery_hold_time': self.recovery_hold_time,
             'current_param': opt_status['current_param'],
             'best_cost': opt_status['best_cost'],
             'iteration': opt_status['iteration'],
@@ -1178,9 +1255,13 @@ class ControlState:
         
         # PID gains (same for both x and y axes) --> DEFAULT VALUES
         # Tuned for faster response while maintaining stability
-        self.Kp = 0.35  # Proportional gain - increased for faster reaction
-        self.Ki = 0.175   # Integral gain - increased to eliminate steady-state error faster
-        self.Kd = 0.300   # Derivative gain - increased for better damping at higher speeds
+        # self.Kp = 0.35  # Proportional gain - increased for faster reaction
+        # self.Ki = 0.175   # Integral gain - increased to eliminate steady-state error faster
+        # self.Kd = 0.300   # Derivative gain - increased for better damping at higher speeds
+
+        self.Kp = 0.2975
+        self.Ki = 0.165
+        self.Kd = 0.39
         
         # Control parameters
         self.max_tilt_angle = 5.0  # degrees (maximum platform tilt)
@@ -2182,13 +2263,28 @@ class UIManager:
                 # Show recovery time if in recovery phase
                 if tuner_status['phase'] == 'RECOVERING' and 'recovery_time' in tuner_status:
                     y_offset += 20
+                    recovery_time = tuner_status['recovery_time']
+                    centered_duration = tuner_status.get('recovery_centered_duration', 0.0)
+                    hold_time = tuner_status.get('recovery_hold_time', 2.0)
+                    
+                    if centered_duration > 0:
+                        # Ball is centered, show progress toward hold time
+                        progress = min(centered_duration / hold_time, 1.0)
+                        status_text = f"RECOVERY: Centered {centered_duration:.2f}s / {hold_time:.1f}s required"
+                        # Color: green when close to completion, yellow otherwise
+                        color = (0, 255, 0) if progress > 0.8 else (0, 255, 255)
+                    else:
+                        # Ball not centered yet
+                        status_text = f"RECOVERY: {recovery_time:.2f}s (max {10.0:.1f}s) - Centering..."
+                        color = (0, 255, 255)  # Yellow
+                    
                     cv2.putText(
                         overlay,
-                        f"RECOVERY: {tuner_status['recovery_time']:.2f}s (max {10.0:.1f}s)",
+                        status_text,
                         (10, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (0, 255, 0),  # Green for recovery
+                        color,
                         1,
                     )
 
