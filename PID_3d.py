@@ -616,6 +616,542 @@ class PIDController:
         self.Kd = Kd
 
 
+class TwiddleOptimizer:
+    """
+    Coordinate Descent (Twiddle) optimizer for PID parameter tuning.
+    Optimizes [Kp, Ki, Kd] by perturbing one parameter at a time.
+    Note: TiltGain is excluded from optimization and should be set manually.
+    """
+    
+    def __init__(self, initial_params: np.ndarray):
+        """
+        Initialize Twiddle optimizer.
+        
+        Args:
+            initial_params: Initial parameter vector [Kp, Ki, Kd]
+        """
+        self.params = np.array(initial_params, dtype=float)
+        
+        # Perturbation vector (how much to change params by initially)
+        # These are relative to typical parameter scales
+        self.d_params = np.array([0.05, 0.01, 0.05], dtype=float)
+        
+        # Parameter bounds to prevent unsafe values
+        self.param_bounds = np.array([
+            [0.0, 50.0],   # Kp: [min, max]
+            [0.0, 20.0],   # Ki: [min, max]
+            [0.0, 10.0],   # Kd: [min, max]
+        ])
+        
+        self.best_cost = float('inf')
+        self.best_params = self.params.copy()  # Track best parameters found
+        self.current_param_idx = 0
+        self.stage = 0  # 0=try positive, 1=try negative
+        self.iteration = 0
+        
+    def get_params(self) -> np.ndarray:
+        """Get current parameter vector [Kp, Ki, Kd]."""
+        return self.params.copy()
+    
+    def report_cost(self, cost: float) -> np.ndarray:
+        """
+        Report cost from an episode and update parameters using Twiddle logic.
+        
+        Args:
+            cost: Cost value from episode (lower is better)
+            
+        Returns:
+            Next parameter vector to try
+        """
+        self.iteration += 1
+        
+        if cost < self.best_cost:
+            # Improvement found - keep the change
+            self.best_cost = cost
+            # Store the parameters that achieved this best cost
+            # Note: params are already updated with the perturbation, so they're the best
+            self.best_params = self.params.copy()
+            self.d_params[self.current_param_idx] *= 1.1  # Speed up search
+            
+            # Move to next parameter
+            self.current_param_idx = (self.current_param_idx + 1) % len(self.params)
+            self.stage = 0
+            
+            print(f"[TWIDDLE] Iteration {self.iteration}: Cost improved to {cost:.5f}, "
+                  f"moving to param {self.current_param_idx}")
+        else:
+            # No improvement
+            if self.stage == 0:
+                # Positive perturbation failed, try negative
+                self.params[self.current_param_idx] -= 2 * self.d_params[self.current_param_idx]
+                self.stage = 1
+                print(f"[TWIDDLE] Iteration {self.iteration}: Positive failed, trying negative")
+            else:
+                # Both positive and negative failed, revert and shrink step size
+                self.params[self.current_param_idx] += self.d_params[self.current_param_idx]
+                self.d_params[self.current_param_idx] *= 0.9  # Slow down search
+                
+                # Move to next parameter
+                self.current_param_idx = (self.current_param_idx + 1) % len(self.params)
+                self.stage = 0
+                
+                print(f"[TWIDDLE] Iteration {self.iteration}: Both directions failed, "
+                      f"shrinking step size, moving to param {self.current_param_idx}")
+        
+        # Clamp parameters to bounds
+        for i in range(len(self.params)):
+            self.params[i] = np.clip(self.params[i], 
+                                     self.param_bounds[i][0], 
+                                     self.param_bounds[i][1])
+        
+        return self.prepare_next_attempt()
+    
+    def prepare_next_attempt(self) -> np.ndarray:
+        """
+        Apply perturbation for the next run.
+        
+        Returns:
+            Parameter vector with perturbation applied
+        """
+        if self.stage == 0:
+            self.params[self.current_param_idx] += self.d_params[self.current_param_idx]
+        
+        # Clamp to bounds
+        for i in range(len(self.params)):
+            self.params[i] = np.clip(self.params[i], 
+                                     self.param_bounds[i][0], 
+                                     self.param_bounds[i][1])
+        
+        return self.params.copy()
+    
+    def get_status(self) -> dict:
+        """Get current optimizer status for display."""
+        param_names = ['Kp', 'Ki', 'Kd']  # TiltGain excluded from optimization
+        return {
+            'params': self.params.copy(),
+            'best_params': self.best_params.copy(),  # Best parameters found so far
+            'param_names': param_names,
+            'current_param': param_names[self.current_param_idx],
+            'best_cost': self.best_cost,
+            'iteration': self.iteration,
+            'd_params': self.d_params.copy()
+        }
+
+
+class AutoTuner:
+    """
+    Manages auto-tuning episodes and cost calculation.
+    Integrates with ControlLoop to perform parameter optimization.
+    """
+    
+    def __init__(self, state: 'ControlState', optimizer: TwiddleOptimizer, 
+                 reset_callback=None):
+        """
+        Initialize auto-tuner.
+        
+        Args:
+            state: ControlState instance
+            optimizer: TwiddleOptimizer instance
+            reset_callback: Callback function to reset PID controllers
+        """
+        self.state = state
+        self.optimizer = optimizer
+        self.reset_callback = reset_callback
+        
+        # Episode configuration
+        self.episode_duration = 5.0  # seconds
+        self.stabilization_duration = 2.0  # seconds to wait for ball to center before test
+        
+        # Episode state
+        self.is_tuning = False
+        self.episode_start_time = None
+        self.stabilization_start_time = None
+        self.episode_phase = "IDLE"  # IDLE, RECOVERING, STABILIZING, RUNNING, FINISHED
+        
+        # Active Recovery state
+        self.recovery_start_time = None
+        self.recovery_timeout = 10.0  # seconds - max time to recover ball
+        self.recovery_params = None  # Best-known PID params for recovery
+        self.best_params_ever = None  # Store best parameters found so far
+        self.best_cost_ever = float('inf')
+        
+        # Cost accumulation
+        self.accumulated_error = 0.0
+        self.accumulated_jitter = 0.0
+        self.prev_ux = 0.0
+        self.prev_uy = 0.0
+        self.time_elapsed = 0.0
+        
+        # Safety limits
+        self.max_error_safety = 0.15  # meters - abort if error exceeds this
+        self.max_tilt_safety = 10.0  # degrees - abort if tilt exceeds this
+        self.recovery_centered_threshold = 0.02  # meters - ball must be within 2cm to consider recovered
+        
+        # Cost function weights
+        self.error_weight = 1.0  # Weight for ITAE term
+        self.jitter_weight = 0.1  # Weight for control effort term
+        
+        # Test maneuver: hybrid approach - cycle through fixed test points
+        # Covers all major directions for comprehensive testing
+        # All points at 5cm radius for consistent evaluation
+        self.test_points = [
+            (0.05, 0.0),           # East
+            (0.035355, -0.035355), # Southeast
+            (0.0, -0.05),          # South
+            (-0.035355, -0.035355),# Southwest
+            (-0.05, 0.0),          # West
+            (-0.035355, 0.035355), # Northwest
+            (0.0, 0.05),           # North
+            (0.035355, 0.035355),  # Northeast
+        ]
+
+        self.test_point_idx = 0  # Current test point index (0-7)
+        
+        # Parameter set evaluation tracking
+        self.current_param_set = None  # Current parameter set being evaluated
+        self.test_points_completed = 0  # How many test points completed for current param set
+        self.accumulated_costs = []  # Costs from each test point for current param set
+        self.param_set_start_time = None  # When current parameter set evaluation started
+        
+        # Episode statistics
+        self.episode_count = 0
+        self.last_cost = None
+    
+    def start_tuning(self):
+        """Start the auto-tuning process."""
+        if self.is_tuning:
+            print("[AUTOTUNER] Already tuning!")
+            return
+        
+        self.is_tuning = True
+        self.episode_count = 0
+        # Reset test point index to start from first test point
+        self.test_point_idx = 0
+        # Reset parameter set evaluation tracking
+        self.current_param_set = None
+        self.test_points_completed = 0
+        self.accumulated_costs = []
+        self.param_set_start_time = None
+        # Initialize best params with current state values
+        self.best_params_ever = np.array([self.state.Kp, self.state.Ki, self.state.Kd])
+        self.best_cost_ever = float('inf')
+        # Check if optimizer already has better params
+        opt_status = self.optimizer.get_status()
+        if opt_status['best_cost'] < float('inf'):
+            # Optimizer has found some good params, use them
+            self.best_params_ever = opt_status['best_params'].copy()
+            self.best_cost_ever = opt_status['best_cost']
+        self.recovery_params = self.best_params_ever.copy()
+        print("[AUTOTUNER] Starting auto-tuning with comprehensive evaluation (all 8 test points per parameter set)...")
+        # Start with recovery to ensure ball is centered
+        self.start_recovery()
+    
+    def stop_tuning(self):
+        """Stop the auto-tuning process."""
+        if not self.is_tuning:
+            return
+        
+        self.is_tuning = False
+        self.episode_phase = "IDLE"
+        print("[AUTOTUNER] Auto-tuning stopped")
+    
+    def start_episode(self):
+        """Start a new tuning episode."""
+        self.episode_count += 1
+        
+        # Reset target to center
+        self.state.x_target = 0.0
+        self.state.y_target = 0.0
+        
+        # Check if we need a new parameter set (after testing all 8 points)
+        if self.test_points_completed >= len(self.test_points):
+            # All test points completed for current parameter set
+            # Report averaged cost to optimizer and get new parameters
+            avg_cost = np.mean(self.accumulated_costs) if self.accumulated_costs else float('inf')
+            print(f"[AUTOTUNER] Parameter set evaluation complete: "
+                  f"Average cost across {len(self.accumulated_costs)} test points = {avg_cost:.5f}")
+            
+            # Report to optimizer and get next parameter set
+            next_params = self.optimizer.report_cost(avg_cost)
+            
+            # Update best parameters if improved
+            opt_status = self.optimizer.get_status()
+            if opt_status['best_cost'] < self.best_cost_ever:
+                self.best_cost_ever = opt_status['best_cost']
+                self.best_params_ever = opt_status['best_params'].copy()
+                self.recovery_params = self.best_params_ever.copy()
+                print(f"[AUTOTUNER] New best cost: {self.best_cost_ever:.5f} with params: "
+                      f"Kp={self.best_params_ever[0]:.5f}, Ki={self.best_params_ever[1]:.5f}, "
+                      f"Kd={self.best_params_ever[2]:.5f}")
+            
+            # Reset for new parameter set
+            new_params = next_params
+            self.current_param_set = tuple(new_params)
+            self.test_points_completed = 0
+            self.accumulated_costs = []
+            self.test_point_idx = 0  # Start from first test point
+            self.param_set_start_time = time.time()
+            
+            print(f"[AUTOTUNER] Starting new parameter set evaluation: "
+                  f"Kp={new_params[0]:.5f}, Ki={new_params[1]:.5f}, Kd={new_params[2]:.5f}")
+        else:
+            # Continue with same parameter set, just get current params
+            new_params = self.optimizer.get_params()
+            # Verify we're still using the same parameter set
+            current_set = tuple(new_params)
+            if self.current_param_set is None:
+                self.current_param_set = current_set
+                self.param_set_start_time = time.time()
+            elif self.current_param_set != current_set:
+                # Parameters changed unexpectedly - reset
+                self.current_param_set = current_set
+                self.test_points_completed = 0
+                self.accumulated_costs = []
+                self.test_point_idx = 0
+        
+        # Apply parameters
+        self.state.Kp = new_params[0]
+        self.state.Ki = new_params[1]
+        self.state.Kd = new_params[2]
+        # TiltGain is NOT updated - keep current manual value
+        
+        # Reset PID controllers
+        if self.reset_callback is not None:
+            self.reset_callback()
+        
+        # Start stabilization phase
+        self.episode_phase = "STABILIZING"
+        self.stabilization_start_time = time.time()
+        self.episode_start_time = None
+        
+        # Reset cost accumulation for this test point
+        self.accumulated_error = 0.0
+        self.accumulated_jitter = 0.0
+        self.prev_ux = 0.0
+        self.prev_uy = 0.0
+        self.time_elapsed = 0.0
+        
+        status = self.optimizer.get_status()
+        print(f"[AUTOTUNER] Episode {self.episode_count}: Test point {self.test_points_completed + 1}/{len(self.test_points)} "
+              f"for param set (Kp={new_params[0]:.5f}, Ki={new_params[1]:.5f}, Kd={new_params[2]:.5f})")
+    
+    def start_recovery(self):
+        """Start active recovery phase using best-known PID parameters."""
+        print(f"[AUTOTUNER] Starting ACTIVE RECOVERY with best params: "
+              f"Kp={self.recovery_params[0]:.5f}, Ki={self.recovery_params[1]:.5f}, "
+              f"Kd={self.recovery_params[2]:.5f}")
+        
+        # Set target to center
+        self.state.x_target = 0.0
+        self.state.y_target = 0.0
+        
+        # Use best-known parameters for recovery
+        self.state.Kp = self.recovery_params[0]
+        self.state.Ki = self.recovery_params[1]
+        self.state.Kd = self.recovery_params[2]
+        
+        # Reset PID controllers
+        if self.reset_callback is not None:
+            self.reset_callback()
+        
+        # Enter recovery phase
+        self.episode_phase = "RECOVERING"
+        self.recovery_start_time = time.time()
+    
+    def update(self, error_x: float, error_y: float, 
+               control_x: float, control_y: float, 
+               tilt_angle: float, dt: float):
+        """
+        Update tuner with current control loop state.
+        
+        Args:
+            error_x: X-axis error (m)
+            error_y: Y-axis error (m)
+            control_x: X-axis control output
+            control_y: Y-axis control output
+            tilt_angle: Current platform tilt angle (degrees)
+            dt: Time step (s)
+        """
+        if not self.is_tuning:
+            return
+        
+        current_time = time.time()
+        error_magnitude = np.sqrt(error_x**2 + error_y**2)
+        control_magnitude = np.sqrt(control_x**2 + control_y**2)
+        
+        # Safety check - abort episode if unsafe (only during RUNNING phase)
+        if self.episode_phase == "RUNNING":
+            if error_magnitude > self.max_error_safety or tilt_angle > self.max_tilt_safety:
+                print(f"[AUTOTUNER] SAFETY ABORT: error={error_magnitude:.5f}m, "
+                      f"tilt={tilt_angle:.5f}deg")
+                self.finish_episode(float('inf'))
+                return
+        
+        # Active Recovery Phase
+        if self.episode_phase == "RECOVERING":
+            # Check if ball is detected
+            if self.state.ball_position is None:
+                # Ball not detected - check timeout
+                recovery_elapsed = current_time - self.recovery_start_time
+                if recovery_elapsed > self.recovery_timeout:
+                    print(f"[AUTOTUNER] RECOVERY FAILED: Ball not detected after {self.recovery_timeout:.1f}s")
+                    print("[AUTOTUNER] ABORTING TUNING - Human intervention required")
+                    self.stop_tuning()
+                    return
+                # Continue trying to recover
+                return
+            
+            # Ball is detected - check if it's centered
+            recovery_elapsed = current_time - self.recovery_start_time
+            
+            # Check if ball is within recovery threshold
+            if error_magnitude < self.recovery_centered_threshold:
+                # Ball is centered! Recovery successful
+                print(f"[AUTOTUNER] RECOVERY SUCCESS: Ball centered after {recovery_elapsed:.2f}s")
+                # Wait a bit more to ensure stability
+                if recovery_elapsed > 1.0:  # At least 1 second of being centered
+                    self.start_episode()
+                return
+            else:
+                # Still recovering - check timeout
+                if recovery_elapsed > self.recovery_timeout:
+                    print(f"[AUTOTUNER] RECOVERY FAILED: Ball not centered after {self.recovery_timeout:.1f}s")
+                    print(f"[AUTOTUNER] Current error: {error_magnitude:.4f}m, threshold: {self.recovery_centered_threshold:.4f}m")
+                    print("[AUTOTUNER] ABORTING TUNING - Human intervention required")
+                    self.stop_tuning()
+                    return
+                # Continue recovery
+                return
+        
+        if self.episode_phase == "STABILIZING":
+            # Wait for ball to stabilize at center
+            if current_time - self.stabilization_start_time < self.stabilization_duration:
+                # Check if ball is centered (within tolerance)
+                if error_magnitude < self.state.centered_tolerance:
+                    # Ball is centered, can proceed
+                    pass
+                else:
+                    # Still waiting for stabilization
+                    return
+            else:
+                # Stabilization timeout - proceed anyway
+                pass
+            
+            # Start the test maneuver - use current test point
+            self.episode_phase = "RUNNING"
+            self.episode_start_time = current_time
+            # Use current test point (will increment after completion)
+            current_test_idx = self.test_point_idx
+            test_x, test_y = self.test_points[current_test_idx]
+            self.state.x_target = test_x
+            self.state.y_target = test_y
+            print(f"[AUTOTUNER] Starting test maneuver: step to ({test_x:.5f}, {test_y:.5f})m "
+                  f"(test point {current_test_idx + 1}/{len(self.test_points)})")
+            return
+        
+        elif self.episode_phase == "RUNNING":
+            # Accumulate cost during episode
+            if self.episode_start_time is None:
+                self.episode_start_time = current_time
+            
+            self.time_elapsed = current_time - self.episode_start_time
+            
+            # ITAE: Integral Time-weighted Absolute Error
+            # Penalize errors that persist over time more heavily
+            self.accumulated_error += (self.time_elapsed * error_magnitude) * dt
+            
+            # Control effort (jitter): penalize rapid control changes
+            jitter_x = abs(control_x - self.prev_ux)
+            jitter_y = abs(control_y - self.prev_uy)
+            jitter_magnitude = np.sqrt(jitter_x**2 + jitter_y**2)
+            self.accumulated_jitter += jitter_magnitude * dt
+            
+            self.prev_ux = control_x
+            self.prev_uy = control_y
+            
+            # Check if episode duration reached
+            if self.time_elapsed >= self.episode_duration:
+                # Calculate total cost
+                total_cost = (self.error_weight * self.accumulated_error + 
+                             self.jitter_weight * self.accumulated_jitter)
+                self.finish_episode(total_cost)
+        
+        elif self.episode_phase == "FINISHED":
+            # Episode finished, waiting for next episode to start
+            pass
+    
+    def finish_episode(self, cost: float):
+        """
+        Finish current episode (one test point) and prepare for next.
+        
+        Args:
+            cost: Total cost for this test point
+        """
+        self.last_cost = cost
+        self.episode_phase = "FINISHED"
+        
+        # Accumulate cost for current parameter set evaluation
+        self.accumulated_costs.append(cost)
+        self.test_points_completed += 1
+        
+        if cost == float('inf'):
+            print(f"[AUTOTUNER] Test point {self.test_points_completed}/{len(self.test_points)} FAILED (safety abort)")
+        else:
+            print(f"[AUTOTUNER] Test point {self.test_points_completed}/{len(self.test_points)} complete: "
+                  f"Cost={cost:.5f} (error={self.accumulated_error:.5f}, "
+                  f"jitter={self.accumulated_jitter:.5f})")
+        
+        # Move to next test point for next episode
+        self.test_point_idx = (self.test_point_idx + 1) % len(self.test_points)
+        
+        # Check if all test points completed for current parameter set
+        if self.test_points_completed >= len(self.test_points):
+            # All test points done - will report averaged cost in start_episode()
+            avg_cost = np.mean(self.accumulated_costs)
+            print(f"[AUTOTUNER] All {len(self.test_points)} test points completed. "
+                  f"Average cost: {avg_cost:.5f} (range: {np.min(self.accumulated_costs):.5f} - {np.max(self.accumulated_costs):.5f})")
+        
+        # CRITICAL: Enter recovery phase instead of immediately starting next episode
+        # This prevents the "death spiral" by ensuring ball is centered before next test
+        # start_episode() will handle reporting to optimizer if all test points are done
+        print("[AUTOTUNER] Test point finished. Entering ACTIVE RECOVERY phase...")
+        self.start_recovery()
+    
+    def get_status(self) -> dict:
+        """Get current tuning status for display."""
+        if not self.is_tuning:
+            return {
+                'is_tuning': False,
+                'phase': 'IDLE',
+                'episode': 0
+            }
+        
+        opt_status = self.optimizer.get_status()
+        
+        # Calculate time elapsed based on current phase
+        if self.episode_phase == "RECOVERING" and self.recovery_start_time:
+            recovery_time = time.time() - self.recovery_start_time
+        else:
+            recovery_time = 0.0
+        
+        return {
+            'is_tuning': True,
+            'phase': self.episode_phase,
+            'episode': self.episode_count,
+            'time_elapsed': self.time_elapsed if self.episode_start_time else 0.0,
+            'recovery_time': recovery_time,
+            'current_param': opt_status['current_param'],
+            'best_cost': opt_status['best_cost'],
+            'iteration': opt_status['iteration'],
+            'last_cost': self.last_cost,
+            'accumulated_error': self.accumulated_error,
+            'accumulated_jitter': self.accumulated_jitter,
+            'test_points_completed': self.test_points_completed,
+            'total_test_points': len(self.test_points),
+            'avg_cost_current_set': np.mean(self.accumulated_costs) if self.accumulated_costs else None
+        }
+
+
 class ControlState:
     """
     Manages control state: gains, target position, and runtime parameters.
@@ -640,7 +1176,7 @@ class ControlState:
         self.y_target_filtered = 0.0
         self.max_target_rate = 5.0  # m/s - maximum rate of setpoint change
         
-        # PID gains (same for both x and y axes)
+        # PID gains (same for both x and y axes) --> DEFAULT VALUES
         # Tuned for faster response while maintaining stability
         self.Kp = 0.35  # Proportional gain - increased for faster reaction
         self.Ki = 0.175   # Integral gain - increased to eliminate steady-state error faster
@@ -668,6 +1204,10 @@ class ControlState:
         
         # Live plotting toggle
         self.live_plotting_enabled = False  # Default to disabled (can be enabled via UI)
+        
+        # Auto-tuning toggle
+        self.auto_tuning_enabled = False  # Default to disabled (can be enabled via UI)
+        self.auto_tuner_status = None  # Status dict from AutoTuner (updated by ControlLoop)
 
 
 class NormalController:
@@ -956,6 +1496,12 @@ class CameraManager:
             print(f"[CAMERA] Failed to open camera {camera_id}")
             self.cap = None
         else:
+            # Set buffer size to 1 to always get the latest frame (reduces latency)
+            # This prevents frame accumulation which causes choppy video
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except:
+                pass  # Some cameras don't support this property
             print(f"[CAMERA] Opened camera {camera_id}")
         
         # Initialize ball detector
@@ -976,6 +1522,7 @@ class CameraManager:
         if self.cap is None:
             return False
         
+        # Read latest frame (buffer size set to 1 in __init__ to reduce latency)
         ret, frame = self.cap.read()
         if not ret:
             return False
@@ -1141,17 +1688,18 @@ class UIManager:
             x_target, y_target = self.pixel_to_platform(x, y)
             self.state.x_target = x_target
             self.state.y_target = y_target
-            print(f"[TARGET] New target set: ({x_target:.4f}, {y_target:.4f}) m")
+            print(f"[TARGET] New target set: ({x_target:.5f}, {y_target:.5f}) m")
     
     def create_control_panel(self):
         """Create control panel window for parameter adjustment."""
         cv2.namedWindow(self.control_window)
         self.selected_param = 0  # Index of currently selected parameter
-        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol', 'LivePlot']
+        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol', 'LivePlot', 'AutoTune']
         self.editing_mode = False
         self.edit_buffer = ""
         self.reset_callback = None  # Callback to reset PIDs when parameters change
         self.plotting_callback = None  # Callback to enable/disable plotting
+        self.tuning_callback = None  # Callback to start/stop auto-tuning
     
     def set_reset_callback(self, callback):
         """Set callback function to reset PID controllers when parameters change."""
@@ -1160,9 +1708,13 @@ class UIManager:
     def set_plotting_callback(self, callback):
         """Set callback function to enable/disable plotting when LivePlot is toggled."""
         self.plotting_callback = callback
+    
+    def set_tuning_callback(self, callback):
+        """Set callback function to start/stop auto-tuning when AutoTune is toggled."""
+        self.tuning_callback = callback
         
     def get_param_value(self, param_name: str):
-        """Get current value of a parameter. Returns float for numeric params, bool for LivePlot."""
+        """Get current value of a parameter. Returns float for numeric params, bool for LivePlot/AutoTune."""
         if param_name == 'Kp':
             return self.state.Kp
         elif param_name == 'Ki':
@@ -1177,11 +1729,13 @@ class UIManager:
             return self.state.centered_tolerance
         elif param_name == 'LivePlot':
             return self.state.live_plotting_enabled
+        elif param_name == 'AutoTune':
+            return self.state.auto_tuning_enabled
         return 0.0
     
     def is_boolean_param(self, param_name: str) -> bool:
         """Check if parameter is boolean (toggle) type."""
-        return param_name == 'LivePlot'
+        return param_name == 'LivePlot' or param_name == 'AutoTune'
     
     def set_param_value(self, param_name: str, value):
         """Set value of a parameter and reset PID controllers to clear accumulated errors."""
@@ -1218,6 +1772,13 @@ class UIManager:
                 self.plotting_callback(self.state.live_plotting_enabled)
             print(f"[PLOTTER] Live plotting {'ENABLED' if self.state.live_plotting_enabled else 'DISABLED'}")
             return  # No reset needed for plotting toggle
+        elif param_name == 'AutoTune':
+            # Toggle boolean value
+            self.state.auto_tuning_enabled = bool(value)
+            if self.tuning_callback is not None:
+                self.tuning_callback(self.state.auto_tuning_enabled)
+            print(f"[AUTOTUNER] Auto-tuning {'ENABLED' if self.state.auto_tuning_enabled else 'DISABLED'}")
+            return  # No reset needed for tuning toggle
         
         # Reset PID controllers if a control parameter was changed
         if needs_reset and self.reset_callback is not None:
@@ -1227,7 +1788,7 @@ class UIManager:
     def update_control_panel(self):
         """Update and display the control panel."""
         # Create blank image for control panel (increased height for new parameter)
-        panel = np.zeros((450, 500, 3), dtype=np.uint8)
+        panel = np.zeros((485, 500, 3), dtype=np.uint8)
         panel[:] = (40, 40, 40)  # Dark gray background
         
         # Title
@@ -1304,7 +1865,7 @@ class UIManager:
                     value_text = self.edit_buffer + "_"
                     value_color = (0, 255, 0)  # Green when editing
                 else:
-                    value_text = f"{value:.3f}"
+                    value_text = f"{value:.5f}"
                     value_color = (255, 255, 255)
                 
                 cv2.putText(panel, value_text, (250, y_pos),
@@ -1356,7 +1917,7 @@ class UIManager:
                 try:
                     value = float(self.edit_buffer)
                     self.set_param_value(param_name, value)
-                    print(f"[PARAM] {param_name} set to {value:.3f}")
+                    print(f"[PARAM] {param_name} set to {value:.5f}")
                 except ValueError:
                     print(f"[ERROR] Invalid number: {self.edit_buffer}")
                 self.editing_mode = False
@@ -1394,9 +1955,9 @@ class UIManager:
                 else:
                     # Start editing numeric parameter
                     current_value = self.get_param_value(param_name)
-                    self.edit_buffer = f"{current_value:.3f}"
+                    self.edit_buffer = f"{current_value:.5f}"
                     self.editing_mode = True
-                    print(f"[PARAM] Editing {param_name} (current: {current_value:.3f})")
+                    print(f"[PARAM] Editing {param_name} (current: {current_value:.5f})")
                     return True
         
         return False
@@ -1418,7 +1979,7 @@ class UIManager:
         overlay = frame.copy()
         h, w = overlay.shape[:2]
         
-        # Draw platform boundary circle (calibrated)
+        # Cache expensive calculations
         center_x, center_y = self.plate_center_px
         
         # Draw crosshair at calibrated platform center (not frame center)
@@ -1467,7 +2028,7 @@ class UIManager:
                 # Change ball color based on whether it's centered
                 ball_color = (0, 255, 0) if self.state.ball_is_centered else (255, 0, 255)
                 cv2.circle(overlay, (ball_x_px, ball_y_px), 10, ball_color, 2)
-                status_text = "CENTERED" if self.state.ball_is_centered else f"({x:.3f}, {y:.3f})m"
+                status_text = "CENTERED" if self.state.ball_is_centered else f"({x:.5f}, {y:.5f})m"
                 cv2.putText(overlay, f"Ball: {status_text}", 
                            (ball_x_px + 15, ball_y_px), cv2.FONT_HERSHEY_SIMPLEX, 
                            0.5, ball_color, 2)
@@ -1502,7 +2063,7 @@ class UIManager:
         
         # Draw status text
         y_offset = 30
-        cv2.putText(overlay, f"Target: ({self.state.x_target:.3f}, {self.state.y_target:.3f}) m",
+        cv2.putText(overlay, f"Target: ({self.state.x_target:.5f}, {self.state.y_target:.5f}) m",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         y_offset += 25
         
@@ -1513,23 +2074,23 @@ class UIManager:
             error_mag = np.sqrt(ex**2 + ey**2)
             error_color = (0, 255, 0) if self.state.ball_is_centered else (255, 255, 0)
             status_str = " [CENTERED]" if self.state.ball_is_centered else ""
-            cv2.putText(overlay, f"Error: {error_mag:.4f}m ({ex:.3f}, {ey:.3f}){status_str}",
+            cv2.putText(overlay, f"Error: {error_mag:.5f}m ({ex:.5f}, {ey:.5f}){status_str}",
                        (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, error_color, 2)
             y_offset += 25
         
         n = self.state.current_normal
         tilt_angle = np.rad2deg(np.arccos(np.clip(n[2], -1.0, 1.0)))
-        cv2.putText(overlay, f"Normal: ({n[0]:.3f}, {n[1]:.3f}, {n[2]:.3f})",
+        cv2.putText(overlay, f"Normal: ({n[0]:.5f}, {n[1]:.5f}, {n[2]:.5f})",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         y_offset += 25
-        cv2.putText(overlay, f"Tilt: {tilt_angle:.1f} deg",
+        cv2.putText(overlay, f"Tilt: {tilt_angle:.5f} deg",
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # PID gains
         y_offset += 30
         cv2.putText(
             overlay,
-            f"Kp: {self.state.Kp:.1f}",
+            f"Kp: {self.state.Kp:.5f}",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -1539,7 +2100,7 @@ class UIManager:
         y_offset += 20
         cv2.putText(
             overlay,
-            f"Ki: {self.state.Ki:.2f}",
+            f"Ki: {self.state.Ki:.5f}",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -1549,7 +2110,7 @@ class UIManager:
         y_offset += 20
         cv2.putText(
             overlay,
-            f"Kd: {self.state.Kd:.1f}",
+            f"Kd: {self.state.Kd:.5f}",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -1559,13 +2120,77 @@ class UIManager:
         y_offset += 20
         cv2.putText(
             overlay,
-            f"CenterTol: {self.state.centered_tolerance*1000:.1f}mm",
+            f"CenterTol: {self.state.centered_tolerance*1000:.5f}mm",
             (10, y_offset),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (150, 200, 255),
             1,
         )
+        
+        # Auto-tuning status (if enabled)
+        if self.state.auto_tuner_status is not None:
+            tuner_status = self.state.auto_tuner_status
+            if tuner_status['is_tuning']:
+                y_offset += 30
+                cv2.putText(
+                    overlay,
+                    f"AUTO-TUNING: Episode {tuner_status['episode']} ({tuner_status['phase']})",
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    2,
+                )
+                y_offset += 20
+                # Show parameter set evaluation progress
+                test_progress = f"Test points: {tuner_status.get('test_points_completed', 0)}/{tuner_status.get('total_test_points', 8)}"
+                if tuner_status.get('avg_cost_current_set') is not None:
+                    test_progress += f" | Avg: {tuner_status['avg_cost_current_set']:.5f}"
+                cv2.putText(
+                    overlay,
+                    test_progress,
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+                y_offset += 20
+                cv2.putText(
+                    overlay,
+                    f"Param: {tuner_status['current_param']} | "
+                    f"Best Cost: {tuner_status['best_cost']:.5f}",
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+                if tuner_status['last_cost'] is not None:
+                    y_offset += 20
+                    cv2.putText(
+                        overlay,
+                        f"Last Cost: {tuner_status['last_cost']:.5f} | "
+                        f"Time: {tuner_status['time_elapsed']:.5f}s",
+                        (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255),
+                        1,
+                    )
+                # Show recovery time if in recovery phase
+                if tuner_status['phase'] == 'RECOVERING' and 'recovery_time' in tuner_status:
+                    y_offset += 20
+                    cv2.putText(
+                        overlay,
+                        f"RECOVERY: {tuner_status['recovery_time']:.2f}s (max {10.0:.1f}s)",
+                        (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),  # Green for recovery
+                        1,
+                    )
 
         # Instructions
         y_offset = h - 60
@@ -1633,6 +2258,16 @@ class ControlLoop:
         # CSV logger for data recording
         self.csv_logger = CSVLogger(runs_dir="Runs")
         self.csv_start_time = None
+        
+        # Auto-tuner (initialized with current parameters)
+        # Only optimize Kp, Ki, Kd - TiltGain is set manually
+        initial_params = np.array([state.Kp, state.Ki, state.Kd])
+        self.optimizer = TwiddleOptimizer(initial_params)
+        self.auto_tuner = AutoTuner(
+            state=state,
+            optimizer=self.optimizer,
+            reset_callback=None  # Will be set in run()
+        )
     
     def set_plotting_enabled(self, enabled: bool):
         """
@@ -1683,6 +2318,17 @@ class ControlLoop:
             self.set_plotting_enabled(enabled)
         self.ui_manager.set_plotting_callback(toggle_plotting)
         
+        # Set up callback for auto-tuning toggle
+        def toggle_tuning(enabled: bool):
+            if enabled:
+                self.auto_tuner.start_tuning()
+            else:
+                self.auto_tuner.stop_tuning()
+        self.ui_manager.set_tuning_callback(toggle_tuning)
+        
+        # Set reset callback for auto-tuner
+        self.auto_tuner.reset_callback = reset_pids
+        
         self.state.running = True
         self.state.last_update_time = time.time()
         self.csv_start_time = time.time()  # For elapsed time calculation
@@ -1702,9 +2348,9 @@ class ControlLoop:
             # Update camera and ball detection (every iteration - critical for control)
             self.camera_manager.update()
             
-            # Update control panel display (every 10 iterations to reduce overhead)
+            # Update control panel display (every 20 iterations to reduce overhead)
             control_panel_counter += 1
-            if control_panel_counter % 10 == 0:
+            if control_panel_counter % 20 == 0:  # Reduced from 10 to 20
                 self.ui_manager.update_control_panel()
             
             # Update PID gains and normal controller parameters (only when changed)
@@ -1806,6 +2452,22 @@ class ControlLoop:
                 self.state.current_normal = n
                 self.state.filtered_normal = self.normal_controller.filtered_normal
                 
+                # Update auto-tuner if enabled
+                if self.state.auto_tuning_enabled:
+                    tilt_angle = np.rad2deg(np.arccos(np.clip(n[2], -1.0, 1.0)))
+                    self.auto_tuner.update(
+                        error_x=ex,
+                        error_y=ey,
+                        control_x=ux,
+                        control_y=uy,
+                        tilt_angle=tilt_angle,
+                        dt=dt
+                    )
+                    # Update status in state for UI display
+                    self.state.auto_tuner_status = self.auto_tuner.get_status()
+                else:
+                    self.state.auto_tuner_status = None
+                
                 # Send to hardware via Arduino servo controller
                 self.servo_controller.set_normal(n[0], n[1], n[2])
             else:
@@ -1817,38 +2479,43 @@ class ControlLoop:
                 uy = 0.0
                 self.state.ball_is_centered = False
             
-            # Log measured values to CSV (every iteration, efficient - no derived calculations)
-            time_elapsed = current_time - self.csv_start_time
-            n = self.state.current_normal
-            self.csv_logger.log_measured(
-                time_abs=current_time,
-                time_elapsed=time_elapsed,
-                x_pos=x,
-                y_pos=y,
-                x_target=self.state.x_target,
-                y_target=self.state.y_target,
-                x_target_filtered=self.state.x_target_filtered,
-                y_target_filtered=self.state.y_target_filtered,
-                x_error=ex,
-                y_error=ey,
-                x_output=ux,
-                y_output=uy,
-                normal_x=n[0],
-                normal_y=n[1],
-                normal_z=n[2],
-                Kp=self.state.Kp,
-                Ki=self.state.Ki,
-                Kd=self.state.Kd,
-                tilt_gain=self.state.tilt_gain,
-                max_tilt_angle=self.state.max_tilt_angle,
-                centered_tolerance=self.state.centered_tolerance,
-                ball_detected=(ball_pos is not None),
-                ball_centered=self.state.ball_is_centered,
-                pid_x_integral=self.pid_x.integral,
-                pid_y_integral=self.pid_y.integral,
-                pid_x_prev_error=self.pid_x.prev_error,
-                pid_y_prev_error=self.pid_y.prev_error
-            )
+            # Log measured values to CSV (every 5 iterations to reduce I/O overhead)
+            # Critical for performance - disk I/O is slow
+            if not hasattr(self, '_csv_counter'):
+                self._csv_counter = 0
+            self._csv_counter += 1
+            if self._csv_counter % 5 == 0:  # Log every 5 iterations (~50-100Hz instead of 500Hz)
+                time_elapsed = current_time - self.csv_start_time
+                n = self.state.current_normal
+                self.csv_logger.log_measured(
+                    time_abs=current_time,
+                    time_elapsed=time_elapsed,
+                    x_pos=x,
+                    y_pos=y,
+                    x_target=self.state.x_target,
+                    y_target=self.state.y_target,
+                    x_target_filtered=self.state.x_target_filtered,
+                    y_target_filtered=self.state.y_target_filtered,
+                    x_error=ex,
+                    y_error=ey,
+                    x_output=ux,
+                    y_output=uy,
+                    normal_x=n[0],
+                    normal_y=n[1],
+                    normal_z=n[2],
+                    Kp=self.state.Kp,
+                    Ki=self.state.Ki,
+                    Kd=self.state.Kd,
+                    tilt_gain=self.state.tilt_gain,
+                    max_tilt_angle=self.state.max_tilt_angle,
+                    centered_tolerance=self.state.centered_tolerance,
+                    ball_detected=(ball_pos is not None),
+                    ball_centered=self.state.ball_is_centered,
+                    pid_x_integral=self.pid_x.integral,
+                    pid_y_integral=self.pid_y.integral,
+                    pid_x_prev_error=self.pid_x.prev_error,
+                    pid_y_prev_error=self.pid_y.prev_error
+                )
             
             # Update live plot periodically (every 30 iterations to reduce CPU load)
             # Only update if plotting is enabled in state
@@ -1859,9 +2526,9 @@ class ControlLoop:
                 if self._plot_counter % 30 == 0:  # Reduced from 5 to 30
                     self.plotter.update_plot()
             
-            # Update display (every 2 iterations to reduce overhead)
+            # Update display (every 5 iterations to reduce overhead - ~30-60fps is plenty for visualization)
             display_counter += 1
-            if display_counter % 2 == 0:
+            if display_counter % 5 == 0:  # Reduced from 2 to 5 for better performance
                 frame = self.camera_manager.get_camera_frame()
                 if frame is not None:
                     overlay = self.ui_manager.draw_overlay(frame)
