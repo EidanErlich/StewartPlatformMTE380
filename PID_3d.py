@@ -10,6 +10,7 @@ This controller integrates:
 - Arduino servo control (based on arduino_controller.py)
 - Inverse kinematics (from inverseKinematics.py) for servo angle calculation
 - Live plotting for PID tuning visualization (last 10 seconds)
+- Data logging to CSV for post-analysis
 
 Control Features:
 - Rate-limited setpoints: Smooth reference changes to prevent control spikes
@@ -27,6 +28,7 @@ Features:
 - Sends computed servo angles to Arduino hardware
 - Non-blocking serial communication for minimal latency
 - Live plots showing position, error, and PID output (10-second window)
+- Logs all control data (time, position, error, PID output, tilt) to CSV
 
 Hardware Interface:
 - Connects to Arduino via serial (auto-detects port)
@@ -57,6 +59,9 @@ from typing import Optional, Tuple
 from collections import deque
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import csv
+import os
+from datetime import datetime
 
 # Import ball detection and inverse kinematics
 from ball_detection import BallDetector
@@ -1295,6 +1300,75 @@ class UIManager:
         return overlay
 
 
+class DataLogger:
+    """
+    Handles CSV logging of flight data.
+    """
+    def __init__(self, directory="logs"):
+        # Create logs directory if it doesn't exist
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            
+        # Generate filename based on timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.filename = os.path.join(directory, f"flight_data_{timestamp}.csv")
+        
+        self.file = open(self.filename, 'w', newline='')
+        self.writer = csv.writer(self.file)
+        
+        # Write Header
+        self.writer.writerow([
+            "Time_s",           # Elapsed time
+            "Target_X_m",       # Desired X
+            "Target_Y_m",       # Desired Y
+            "Current_X_m",      # Actual X
+            "Current_Y_m",      # Actual Y
+            "Error_X_m",        # Displacement X
+            "Error_Y_m",        # Displacement Y
+            "Error_Dist_m",     # Total Error Magnitude
+            "PID_Out_X",        # Control Signal X
+            "PID_Out_Y",        # Control Signal Y
+            "Normal_X",         # Platform Normal X
+            "Normal_Y",         # Platform Normal Y
+            "Normal_Z",         # Platform Normal Z
+            "Tilt_Angle_deg",   # Calculated total tilt
+            "Centered"          # Boolean flag
+        ])
+        print(f"[LOGGER] Recording data to: {self.filename}")
+
+    def log_step(self, time_s, target_x, target_y, cur_x, cur_y, 
+                 err_x, err_y, err_dist, pid_x, pid_y, 
+                 nx, ny, nz, centered):
+        
+        # Calculate tilt angle from normal vector (angle from vertical Z)
+        # nz = cos(theta), so theta = arccos(nz)
+        # Clip nz to [-1, 1] to avoid domain errors
+        tilt_deg = np.rad2deg(np.arccos(np.clip(nz, -1.0, 1.0)))
+
+        self.writer.writerow([
+            f"{time_s:.4f}",
+            f"{target_x:.4f}",
+            f"{target_y:.4f}",
+            f"{cur_x:.4f}",
+            f"{cur_y:.4f}",
+            f"{err_x:.4f}",
+            f"{err_y:.4f}",
+            f"{err_dist:.4f}",
+            f"{pid_x:.4f}",
+            f"{pid_y:.4f}",
+            f"{nx:.4f}",
+            f"{ny:.4f}",
+            f"{nz:.4f}",
+            f"{tilt_deg:.2f}",
+            1 if centered else 0
+        ])
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            print(f"[LOGGER] Log saved to {self.filename}")
+
+
 class ControlLoop:
     """
     Main control loop that coordinates all components.
@@ -1319,6 +1393,10 @@ class ControlLoop:
         self.normal_controller = normal_controller
         self.ui_manager = ui_manager
         self.servo_controller = servo_controller
+        
+        # Initialize Data Logger
+        self.logger = DataLogger()
+        self.start_time = None
         
         # PID controllers (same gains for both X and Y)
         self.pid_x = PIDController(
@@ -1365,6 +1443,7 @@ class ControlLoop:
         self.ui_manager.set_reset_callback(reset_pids)
         
         self.state.running = True
+        self.start_time = time.time()  # Set start time for logging
         self.state.last_update_time = time.time()
         
         # Initialize filtered setpoint to current target
@@ -1457,6 +1536,25 @@ class ControlLoop:
                 self.state.current_normal = n
                 self.state.filtered_normal = self.normal_controller.filtered_normal
                 
+                # --- LOG DATA ---
+                elapsed_time = time.time() - self.start_time
+                self.logger.log_step(
+                    time_s=elapsed_time,
+                    target_x=self.state.x_target_filtered,
+                    target_y=self.state.y_target_filtered,
+                    cur_x=x,
+                    cur_y=y,
+                    err_x=ex,
+                    err_y=ey,
+                    err_dist=error_magnitude,
+                    pid_x=ux,
+                    pid_y=uy,
+                    nx=n[0],
+                    ny=n[1],
+                    nz=n[2],
+                    centered=is_centered
+                )
+                
                 # Send to hardware via Arduino servo controller
                 self.servo_controller.set_normal(n[0], n[1], n[2])
             
@@ -1496,6 +1594,10 @@ class ControlLoop:
         print("[CLEANUP] Setting platform to flat")
         self.servo_controller.set_normal(0.0, 0.0, 1.0)
         self.camera_manager.close()
+        
+        # Close logger
+        self.logger.close()
+        
         if self.plotter is not None:
             self.plotter.close()
         cv2.destroyAllWindows()
