@@ -6,12 +6,12 @@ import os
 class BallDetector:
     """Computer vision ball detector using HSV color space filtering with camera calibration."""
 
-    def __init__(self, config_file="config.json", calib_file="cal/camera_calib.npz"):
+    def __init__(self, config_file="config.json", calib_file=None):
         """Initialize ball detector with HSV bounds and camera calibration.
         
         Args:
             config_file: Path to config.json with HSV bounds and coordinate frame
-            calib_file: Path to camera calibration .npz file with K and dist
+            calib_file: Path to camera calibration .npz file with K and dist (optional, None to disable)
         """
         # Default HSV bounds for orange ball detection
         self.lower_hsv = np.array([5, 150, 150], dtype=np.uint8)
@@ -30,8 +30,8 @@ class BallDetector:
         self.newK = None
         self.has_camera_calib = False
 
-        # Load camera calibration
-        if os.path.exists(calib_file):
+        # Load camera calibration (only if calib_file is provided)
+        if calib_file is not None and os.path.exists(calib_file):
             try:
                 data = np.load(calib_file, allow_pickle=True)
                 self.K = data["K"].astype(np.float64)
@@ -41,6 +41,8 @@ class BallDetector:
                 print(f"  K shape: {self.K.shape}, dist shape: {self.dist.shape}")
             except Exception as e:
                 print(f"[BALL_DETECT] Camera calibration load error: {e}")
+        elif calib_file is None:
+            print("[BALL_DETECT] Camera calibration disabled (calib_file=None)")
         else:
             print(f"[BALL_DETECT] Camera calibration file not found: {calib_file}")
 

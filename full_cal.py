@@ -519,15 +519,26 @@ def pair_points_by_distance(pts, expected_pairs=3, max_pair_px=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Live plane-normal estimation from 6 screws (3 pairs) on a circular plate.")
-    ap.add_argument("--calib", type=str, default="camera_calib.npz", help="npz with K, dist")
+    ap.add_argument("--calib", type=str, default=None, help="npz with K, dist (optional)")
     ap.add_argument("--cam", type=int, default=0, help="camera index")
     ap.add_argument("--fullcal", action="store_true", help="Run full calibration GUI and save config.json then exit")
     args = ap.parse_args()
 
-    # Load intrinsics
-    data = np.load(args.calib, allow_pickle=True)
-    K = data["K"].astype(np.float64)
-    dist = data["dist"].astype(np.float64)
+    # Load intrinsics if calibration file is provided
+    K = None
+    dist = None
+    if args.calib is not None:
+        try:
+            data = np.load(args.calib, allow_pickle=True)
+            K = data["K"].astype(np.float64)
+            dist = data["dist"].astype(np.float64)
+            print(f"[INFO] Loaded camera calibration from {args.calib}")
+        except FileNotFoundError:
+            print(f"[WARN] Calibration file {args.calib} not found. Running without camera calibration.")
+        except Exception as e:
+            print(f"[WARN] Failed to load calibration file: {e}. Running without camera calibration.")
+    else:
+        print("[INFO] No calibration file provided. Running without camera calibration.")
 
     # Build model points for 3 joint centers (z=0)
     thetas = np.radians(ANGLES_DEG)
@@ -536,18 +547,26 @@ def main():
                          dtype=np.float64)
 
     # Estimate pixel area and diameter for the expected point size
-    est_area = estimate_pixel_area_for_size(POINT_DIAMETER_M, K, WORKING_DISTANCE_M)
-    fx = K[0, 0]
-    expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
-    min_diameter_px = expected_diameter_px * 0.7
-    max_diameter_px = expected_diameter_px * 1.3
-    # Use a range around the estimated area (±50% tolerance)
-    min_area = int(est_area * 0.3)  # Allow some smaller
-    max_area = int(est_area * 2.0)  # Allow some larger
-    print(f"Point detection: {POINT_DIAMETER_M * 1000:.1f}mm diameter")
-    print(f"  Estimated pixel diameter: {expected_diameter_px:.1f} px (range: {min_diameter_px:.1f}-{max_diameter_px:.1f} px)")
-    print(f"  Estimated pixel area: {est_area:.1f} px (range: {min_area}-{max_area} px)")
-    print(f"  Point smoothing alpha: {POINT_SMOOTH_ALPHA:.2f}")
+    if K is not None:
+        est_area = estimate_pixel_area_for_size(POINT_DIAMETER_M, K, WORKING_DISTANCE_M)
+        fx = K[0, 0]
+        expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
+        min_diameter_px = expected_diameter_px * 0.7
+        max_diameter_px = expected_diameter_px * 1.3
+        # Use a range around the estimated area (±50% tolerance)
+        min_area = int(est_area * 0.3)  # Allow some smaller
+        max_area = int(est_area * 2.0)  # Allow some larger
+        print(f"Point detection: {POINT_DIAMETER_M * 1000:.1f}mm diameter")
+        print(f"  Estimated pixel diameter: {expected_diameter_px:.1f} px (range: {min_diameter_px:.1f}-{max_diameter_px:.1f} px)")
+        print(f"  Estimated pixel area: {est_area:.1f} px (range: {min_area}-{max_area} px)")
+        print(f"  Point smoothing alpha: {POINT_SMOOTH_ALPHA:.2f}")
+    else:
+        # Use default values when no calibration is available
+        min_area = 50
+        max_area = 500
+        print(f"Point detection: {POINT_DIAMETER_M * 1000:.1f}mm diameter")
+        print(f"  Using default detection parameters (no calibration available)")
+        print(f"  Point smoothing alpha: {POINT_SMOOTH_ALPHA:.2f}")
 
     # Detector tuned for ~1cm diameter dark, round points
     detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
@@ -648,7 +667,7 @@ def main():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         disp = frame.copy()
 
-        if PREVIEW:
+        if PREVIEW and K is not None and dist is not None:
             newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (frame.shape[1], frame.shape[0]), 0)
             disp = cv2.undistort(frame, K, dist, None, newK)
 
@@ -658,10 +677,15 @@ def main():
         keypoints = detector.detect(blurred)
 
         # Filter by size (diameter) - estimate expected pixel diameter for point size
-        fx = K[0, 0]
-        expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
-        min_diameter_px = expected_diameter_px * 0.5  # Allow 50% smaller
-        max_diameter_px = expected_diameter_px * 1.5  # Allow 50% larger
+        if K is not None:
+            fx = K[0, 0]
+            expected_diameter_px = (POINT_DIAMETER_M * fx) / WORKING_DISTANCE_M
+            min_diameter_px = expected_diameter_px * 0.5  # Allow 50% smaller
+            max_diameter_px = expected_diameter_px * 1.5  # Allow 50% larger
+        else:
+            # Use permissive defaults when no calibration is available
+            min_diameter_px = 5
+            max_diameter_px = 50
 
         # Filter keypoints by size
         filtered_keypoints = []
@@ -684,7 +708,8 @@ def main():
             candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=MAX_PAIR_PX)
             if candidate_pairs:
                 # optional: if physical pair separation is known, filter pairs by expected pixel separation
-                if PAIR_SEP_M is not None and len(candidate_pairs) > 0:
+                if PAIR_SEP_M is not None and len(candidate_pairs) > 0 and K is not None:
+                    fx = K[0, 0]
                     expected_px = (PAIR_SEP_M * fx) / WORKING_DISTANCE_M
                     tol_px = expected_px * PAIR_SEP_TOL
                     filtered_pairs = []
