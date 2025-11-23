@@ -36,9 +36,10 @@ Hardware Interface:
 - Falls back to simulation mode if Arduino not connected
 
 Usage:
-    python PID_3d.py                     # Run with live plotting
-    python PID_3d.py --no-plot           # Run without plotting (lower CPU usage)
-    python PID_3d.py cal/camera_calib.npz  # Run with camera calibration
+    python PID_3d.py                        # Run with live plotting
+    python PID_3d.py --no-plot              # Run without plotting (lower CPU usage)
+    python PID_3d.py --dt 0.1               # Run at fixed 10Hz (simulate slow plant)
+    python PID_3d.py cal/camera_calib.npz   # Run with camera calibration
     
 Controls:
     - Click on camera window to set target position
@@ -1376,7 +1377,8 @@ class ControlLoop:
     
     def __init__(self, state: ControlState, camera_manager: CameraManager,
                  normal_controller: NormalController, ui_manager: UIManager,
-                 servo_controller: ArduinoServoController, enable_plotting: bool = True):
+                 servo_controller: ArduinoServoController, enable_plotting: bool = True,
+                 target_dt: float = 0.0):  # <-- Added target_dt here
         """
         Initialize control loop.
         
@@ -1387,12 +1389,14 @@ class ControlLoop:
             ui_manager: UIManager instance
             servo_controller: ArduinoServoController instance
             enable_plotting: Enable live plotting for PID tuning (default: True)
+            target_dt: Target loop time in seconds (0.0 = max speed)
         """
         self.state = state
         self.camera_manager = camera_manager
         self.normal_controller = normal_controller
         self.ui_manager = ui_manager
         self.servo_controller = servo_controller
+        self.target_dt = target_dt  # <-- Store target_dt
         
         # Initialize Data Logger
         self.logger = DataLogger()
@@ -1589,6 +1593,11 @@ class ControlLoop:
                         print("[RESET] Resetting PID integrals")
                         self.pid_x.reset()
                         self.pid_y.reset()
+            
+            # Enforce minimum sampling time (Simulate discrete plant)
+            elapsed = time.time() - loop_start
+            if elapsed < self.target_dt:
+                time.sleep(self.target_dt - elapsed)
         
         # Cleanup: set platform to flat
         print("[CLEANUP] Setting platform to flat")
@@ -1627,6 +1636,12 @@ Examples:
         action='store_true',
         help='Disable live plotting (reduces CPU usage)'
     )
+    parser.add_argument(
+        '--dt',
+        type=float,
+        default=0.0,
+        help='Force minimum sampling time (s) to simulate discrete/slow plant'
+    )
     args = parser.parse_args()
     
     print("="*70)
@@ -1642,6 +1657,9 @@ Examples:
         print("[CONFIG] Live plotting: DISABLED")
     else:
         print("[CONFIG] Live plotting: ENABLED")
+        
+    if args.dt > 0:
+        print(f"[CONFIG] Forced Sampling Time: {args.dt}s ({1/args.dt:.1f} Hz)")
     print("="*70)
     
     # Initialize components
@@ -1672,7 +1690,8 @@ Examples:
     
     # Create and run control loop
     control_loop = ControlLoop(state, camera_manager, normal_controller, ui_manager, 
-                               servo_controller, enable_plotting=not args.no_plot)
+                               servo_controller, enable_plotting=not args.no_plot,
+                               target_dt=args.dt)  # <-- Pass dt here
     
     try:
         control_loop.run()
