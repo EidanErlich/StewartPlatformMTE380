@@ -23,3 +23,5 @@ env/
 
 # Platform IO
 .pio/
+
+config.json
