@@ -436,7 +436,7 @@ class ControlState:
         
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
-        self.centered_tolerance = 0.015  # meters (3mm margin)
+        self.centered_tolerance = 0.010  # meters (3mm margin)
 
 
 class NormalController:
