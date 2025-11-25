@@ -3,3 +3,4 @@ numpy
 pyserial
 pynput
 opencv-python
+scipy
