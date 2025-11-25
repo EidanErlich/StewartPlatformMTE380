@@ -414,12 +414,12 @@ class ControlState:
         
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
-        self.Kp = 0.35  # Proportional gain - increased for faster reaction
-        self.Ki = 0.175   # Integral gain - increased to eliminate steady-state error faster
-        self.Kd = 0.300   # Derivative gain - increased for better damping at higher speeds
+        self.Kp = 0.2975  # Proportional gain - increased for faster reaction
+        self.Ki = 0.206   # Integral gain - increased to eliminate steady-state error faster
+        self.Kd = 0.31   # Derivative gain - increased for better damping at higher speeds
         
         # Control parameters
-        self.max_tilt_angle = 5.0  # degrees (maximum platform tilt)
+        self.max_tilt_angle = 8.0  # degrees (maximum platform tilt)
         self.tilt_gain = 1.0  # Scaling factor from PID output to tilt - increased for faster response
         self.normal_filter_alpha = 1.0  # Smoothing on normal vector (0=no smoothing, 1=instant)
         
