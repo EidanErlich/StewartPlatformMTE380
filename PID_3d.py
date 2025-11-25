@@ -311,81 +311,148 @@ class LivePlotter:
         plt.close(self.fig)
 
 
+# class PIDController:
+#     """
+#     Simple PID controller.
+#     """
+    
+#     def __init__(self, Kp: float = 1.0, Ki: float = 0.0, Kd: float = 0.0,
+#                  output_limit: float = 1.0):
+#         """
+#         Initialize PID controller.
+        
+#         Args:
+#             Kp: Proportional gain
+#             Ki: Integral gain
+#             Kd: Derivative gain
+#             output_limit: Maximum absolute value for PID output (saturation)
+#         """
+#         self.Kp = Kp
+#         self.Ki = Ki
+#         self.Kd = Kd
+#         self.output_limit = output_limit
+        
+#         # Internal state
+#         self.integral = 0.0
+#         self.prev_error = 0.0
+        
+#     def update(self, error: float, measurement: float, dt: float) -> float:
+#         """
+#         Update PID controller and return control output.
+        
+#         Args:
+#             error: Current error (setpoint - measurement)
+#             measurement: Current measurement value (unused in simple version)
+#             dt: Time step in seconds
+            
+#         Returns:
+#             Control output (clamped to output_limit)
+#         """
+#         if dt <= 0:
+#             dt = 0.001  # Prevent division by zero
+        
+#         # Proportional term
+#         P = self.Kp * error
+        
+#         # Integral term
+#         self.integral += error * dt
+#         I = self.Ki * self.integral
+#         # Anti-windup: clamp the integral state so the I term cannot exceed the actuator limits
+#         if abs(self.Ki) > 1e-12:
+#             integral_limit = abs(self.output_limit) / abs(self.Ki)
+#             self.integral = np.clip(self.integral, -integral_limit, integral_limit)
+#             I = self.Ki * self.integral
+#         else:
+#             # Ki is zero (or effectively zero) — ensure no accidental large integral contribution
+#             self.integral = 0.0
+#             I = 0.0
+        
+#         # Derivative term
+#         derivative = (error - self.prev_error) / dt
+#         D = self.Kd * derivative
+        
+#         # Compute output
+#         output = P + I + D
+        
+#         # Saturate output
+#         output = np.clip(output, -self.output_limit, self.output_limit)
+        
+#         # Update state
+#         self.prev_error = error
+        
+#         return output
+    
+#     def reset(self):
+#         """Reset internal state."""
+#         self.integral = 0.0
+#         self.prev_error = 0.0
+
 class PIDController:
     """
-    Simple PID controller.
+    PID Controller with Derivative Low Pass Filter (No Feedforward).
     """
     
     def __init__(self, Kp: float = 1.0, Ki: float = 0.0, Kd: float = 0.0,
-                 output_limit: float = 1.0):
+                 alpha: float = 0.35, output_limit: float = 1.0):
         """
-        Initialize PID controller.
-        
         Args:
-            Kp: Proportional gain
-            Ki: Integral gain
-            Kd: Derivative gain
-            output_limit: Maximum absolute value for PID output (saturation)
+            alpha: Smoothing factor (0.0 to 1.0).
+                   0.0 = No filtering (Raw derivative, noisy)
+                   0.9 = Heavy filtering (Very smooth, but laggy)
         """
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
+        self.alpha = alpha 
         self.output_limit = output_limit
         
         # Internal state
         self.integral = 0.0
         self.prev_error = 0.0
+        self.prev_derivative = 0.0  # MEMORY FOR THE FILTER
         
     def update(self, error: float, measurement: float, dt: float) -> float:
-        """
-        Update PID controller and return control output.
-        
-        Args:
-            error: Current error (setpoint - measurement)
-            measurement: Current measurement value (unused in simple version)
-            dt: Time step in seconds
-            
-        Returns:
-            Control output (clamped to output_limit)
-        """
         if dt <= 0:
-            dt = 0.001  # Prevent division by zero
-        
-        # Proportional term
+            dt = 0.001
+
+        # 1. Proportional
         P = self.Kp * error
         
-        # Integral term
+        # 2. Integral (Clamped)
         self.integral += error * dt
-        I = self.Ki * self.integral
-        # Anti-windup: clamp the integral state so the I term cannot exceed the actuator limits
         if abs(self.Ki) > 1e-12:
-            integral_limit = abs(self.output_limit) / abs(self.Ki)
-            self.integral = np.clip(self.integral, -integral_limit, integral_limit)
-            I = self.Ki * self.integral
+            limit = abs(self.output_limit) / abs(self.Ki)
+            self.integral = np.clip(self.integral, -limit, limit)
         else:
-            # Ki is zero (or effectively zero) — ensure no accidental large integral contribution
             self.integral = 0.0
-            I = 0.0
+        I = self.Ki * self.integral
+
+        # 3. Derivative with Low Pass Filter
+        # Calculate the raw, noisy slope
+        raw_derivative = (error - self.prev_error) / dt
         
-        # Derivative term
-        derivative = (error - self.prev_error) / dt
+        # Apply the filter:
+        # We blend the Old Derivative (smooth history) with the New Raw Derivative.
+        # If alpha is 0.2, we keep 20% history and take 80% new data.
+        derivative = (self.alpha * self.prev_derivative) + ((1 - self.alpha) * raw_derivative)
+        
+        # Store this filtered value for the next loop
+        self.prev_derivative = derivative
+        
         D = self.Kd * derivative
         
-        # Compute output
+        # Compute Output
         output = P + I + D
-        
-        # Saturate output
         output = np.clip(output, -self.output_limit, self.output_limit)
         
-        # Update state
         self.prev_error = error
         
         return output
-    
+
     def reset(self):
-        """Reset internal state."""
         self.integral = 0.0
         self.prev_error = 0.0
+        self.prev_derivative = 0.0 # Reset the filter memory too
     
     def set_prev_error(self, error: float):
         """
@@ -434,6 +501,9 @@ class ControlState:
         self.x_target = 0.0
         self.y_target = 0.0
         
+        # Ball radius (meters) - physical radius of the ball
+        self.ball_radius = 0.01  # 1cm radius (typical ping pong ball)
+        
         # Rate-limited target position (smooth setpoint changes)
         self.x_target_filtered = 0.0
         self.y_target_filtered = 0.0
@@ -442,12 +512,13 @@ class ControlState:
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
         # DEFAULT VALUES
-        self.Kp = 0.5  # Proportional gain 
-        self.Ki = 0.02   # Integral gain 
-        self.Kd = 0.4   # Derivative gain 
-        # self.Kp = 0.275  # Proportional gain - increased for faster reaction
-        # self.Ki = 0.0   # Integral gain - increased to eliminate steady-state error faster
-        # self.Kd = 0.0   # Derivative gain - increased for better damping at higher speeds
+        self.Kp = 0.45  # Proportional gain 
+        self.Ki = 0.044   # Integral gain 
+        self.Kd = 0.528   # Derivative gain 
+        # 
+        # self.Kp = 0.45  # Proportional gain 
+        # self.Ki = 0.035   # Integral gain 
+        # self.Kd = 0.56   # Derivative gain 
         
 
         
@@ -469,7 +540,7 @@ class ControlState:
         
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
-        self.centered_tolerance = 0.0005  # meters (3mm margin)
+        self.centered_tolerance = 0.01  # meters (3mm margin)
 
 
 class NormalController:
@@ -949,7 +1020,7 @@ class UIManager:
         """Create control panel window for parameter adjustment."""
         cv2.namedWindow(self.control_window)
         self.selected_param = 0  # Index of currently selected parameter
-        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol']
+        self.param_names = ['Kp', 'Ki', 'Kd', 'TiltGain', 'MaxTilt', 'CenterTol', 'BallRadius']
         self.editing_mode = False
         self.edit_buffer = ""
         self.reset_callback = None  # Callback to reset PIDs when parameters change
@@ -972,6 +1043,8 @@ class UIManager:
             return self.state.max_tilt_angle
         elif param_name == 'CenterTol':
             return self.state.centered_tolerance
+        elif param_name == 'BallRadius':
+            return self.state.ball_radius
         return 0.0
     
     def set_param_value(self, param_name: str, value: float):
@@ -997,6 +1070,9 @@ class UIManager:
         elif param_name == 'CenterTol':
             self.state.centered_tolerance = min(value, 0.05)  # Max 5cm
             # CenterTol doesn't need PID reset
+        elif param_name == 'BallRadius':
+            self.state.ball_radius = min(value, 0.05)  # Max 5cm radius
+            # BallRadius doesn't need PID reset
         
         # Reset PID controllers if a control parameter was changed
         if needs_reset and self.reset_callback is not None:
@@ -1199,16 +1275,22 @@ class UIManager:
                     cv2.line(overlay, tick_start, tick_end, (0, 200, 0), 1)
                     distance_m += tick_interval_m
         
-        # Draw target position using calibrated conversion
+        # Draw target position and centered_tolerance circle using calibrated conversion
         target_x_px, target_y_px = self.platform_to_pixel(self.state.x_target, self.state.y_target)
         if 0 <= target_x_px < w and 0 <= target_y_px < h:
-            # Draw centered tolerance zone as a circle around target
+            # Draw centered_tolerance circle (filled with transparency)
             tolerance_radius_px = int(self.state.centered_tolerance / self.pixel_to_meter_ratio)
-            cv2.circle(overlay, (target_x_px, target_y_px), tolerance_radius_px, (0, 200, 100), 1)
-            
+            # Draw filled circle with transparency
+            overlay_copy = overlay.copy()
+            cv2.circle(overlay_copy, (target_x_px, target_y_px), tolerance_radius_px, (0, 200, 100), -1)
+            cv2.addWeighted(overlay, 0.7, overlay_copy, 0.3, 0, overlay)
+            # Draw circle outline
+            cv2.circle(overlay, (target_x_px, target_y_px), tolerance_radius_px, (0, 200, 100), 2)
+            # Draw center marker
             cv2.drawMarker(overlay, (target_x_px, target_y_px), (0, 255, 0), 
                           cv2.MARKER_CROSS, 20, 2)
-            cv2.putText(overlay, "Target", (target_x_px + 5, target_y_px - 10),
+            cv2.putText(overlay, f"Target (tol={self.state.centered_tolerance*1000:.0f}mm)", 
+                       (target_x_px + tolerance_radius_px + 5, target_y_px - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         # Draw ball position if available (using calibrated conversion)
@@ -1216,12 +1298,22 @@ class UIManager:
             x, y = self.state.ball_position
             ball_x_px, ball_y_px = self.platform_to_pixel(x, y)
             if 0 <= ball_x_px < w and 0 <= ball_y_px < h:
+                # Draw ball circle with its radius
+                ball_radius_px = int(self.state.ball_radius / self.pixel_to_meter_ratio)
                 # Change ball color based on whether it's centered
                 ball_color = (0, 255, 0) if self.state.ball_is_centered else (255, 0, 255)
-                cv2.circle(overlay, (ball_x_px, ball_y_px), 10, ball_color, 2)
+                # Draw filled circle with transparency
+                overlay_copy = overlay.copy()
+                cv2.circle(overlay_copy, (ball_x_px, ball_y_px), ball_radius_px, ball_color, -1)
+                cv2.addWeighted(overlay, 0.7, overlay_copy, 0.3, 0, overlay)
+                # Draw circle outline
+                cv2.circle(overlay, (ball_x_px, ball_y_px), ball_radius_px, ball_color, 2)
+                # Draw center marker
+                cv2.drawMarker(overlay, (ball_x_px, ball_y_px), ball_color, 
+                              cv2.MARKER_CROSS, 5, 1)
                 status_text = "CENTERED" if self.state.ball_is_centered else f"({x:.3f}, {y:.3f})m"
-                cv2.putText(overlay, f"Ball: {status_text}", 
-                           (ball_x_px + 15, ball_y_px), cv2.FONT_HERSHEY_SIMPLEX, 
+                cv2.putText(overlay, f"Ball (r={self.state.ball_radius*1000:.0f}mm): {status_text}", 
+                           (ball_x_px + ball_radius_px + 5, ball_y_px), cv2.FONT_HERSHEY_SIMPLEX, 
                            0.5, ball_color, 2)
         
         # Draw commanded normal vector as arrow from origin
@@ -1538,13 +1630,39 @@ class ControlLoop:
             if ball_pos is not None:
                 x, y = ball_pos
 
-                # Compute errors using rate-limited setpoint
-                ex = self.state.x_target_filtered - x
-                ey = self.state.y_target_filtered - y
+                # Compute errors accounting for ball radius and centered_tolerance
+                # Distance from ball center to target center
+                dx = self.state.x_target_filtered - x
+                dy = self.state.y_target_filtered - y
+                distance_to_center = np.sqrt(dx**2 + dy**2)
                 
-                # Check if ball is within centered tolerance
+                # Combined radius: ball circle overlaps with centered_tolerance circle if 
+                # distance <= (centered_tolerance + ball_radius)
+                combined_radius = self.state.centered_tolerance + self.state.ball_radius
+                
+                # Ball is "centered" if ball circle overlaps with centered_tolerance circle
+                if distance_to_center <= combined_radius:
+                    # Ball circle overlaps with centered_tolerance circle - zero error
+                    ex = 0.0
+                    ey = 0.0
+                    is_centered = True
+                else:
+                    # Ball circle doesn't overlap - error is distance from ball edge to centered_tolerance edge
+                    # Normalize direction vector (from target center to ball center)
+                    if distance_to_center > 1e-8:
+                        direction_x = dx / distance_to_center
+                        direction_y = dy / distance_to_center
+                    else:
+                        direction_x = 0.0
+                        direction_y = 0.0
+                    
+                    # Error is the distance from ball edge to centered_tolerance circle edge
+                    error_distance = distance_to_center - combined_radius
+                    ex = error_distance * direction_x
+                    ey = error_distance * direction_y
+                    is_centered = False
+                
                 error_magnitude = np.sqrt(ex**2 + ey**2)
-                is_centered = error_magnitude < self.state.centered_tolerance
                 self.state.ball_is_centered = is_centered
                 
                 # Detect mode transition for bumpless transfer
@@ -1681,9 +1799,11 @@ class ControlLoop:
         # Ramp parameters
         ramp_duration = 5.0  # seconds to ramp up/down
         hold_duration = 5.0  # seconds to hold at each position
-        max_position = 0.08  # meters
+        # max_position = 0.08  # meters
+        max_position = 0.00  # meters
+
         min_position = 0.0   # meters
-        num_iterations = 3
+        num_iterations = 10
         
         # Calculate total test duration
         cycle_duration = 2 * (ramp_duration + hold_duration)  # 20 seconds per cycle
@@ -1691,9 +1811,12 @@ class ControlLoop:
         
         # Data storage for plotting
         test_times = []
-        command_positions = []
-        output_positions = []
-        control_signals = []
+        x_command_positions = []
+        x_output_positions = []
+        x_control_signals = []
+        y_command_positions = []
+        y_output_positions = []
+        y_control_signals = []
         
         # Initialize UI (minimal - just for display)
         cv2.namedWindow(self.ui_manager.window_name)
@@ -1807,13 +1930,39 @@ class ControlLoop:
                 x_pos = x
                 y_pos = y
                 
-                # Compute errors using rate-limited setpoint
-                ex = self.state.x_target_filtered - x
-                ey = self.state.y_target_filtered - y
+                # Compute errors accounting for ball radius and centered_tolerance
+                # Distance from ball center to target center
+                dx = self.state.x_target_filtered - x
+                dy = self.state.y_target_filtered - y
+                distance_to_center = np.sqrt(dx**2 + dy**2)
                 
-                # Check if ball is within centered tolerance
+                # Combined radius: ball circle overlaps with centered_tolerance circle if 
+                # distance <= (centered_tolerance + ball_radius)
+                combined_radius = self.state.centered_tolerance + self.state.ball_radius
+                
+                # Ball is "centered" if ball circle overlaps with centered_tolerance circle
+                if distance_to_center <= combined_radius:
+                    # Ball circle overlaps with centered_tolerance circle - zero error
+                    ex = 0.0
+                    ey = 0.0
+                    is_centered = True
+                else:
+                    # Ball circle doesn't overlap - error is distance from ball edge to centered_tolerance edge
+                    # Normalize direction vector (from target center to ball center)
+                    if distance_to_center > 1e-8:
+                        direction_x = dx / distance_to_center
+                        direction_y = dy / distance_to_center
+                    else:
+                        direction_x = 0.0
+                        direction_y = 0.0
+                    
+                    # Error is the distance from ball edge to centered_tolerance circle edge
+                    error_distance = distance_to_center - combined_radius
+                    ex = error_distance * direction_x
+                    ey = error_distance * direction_y
+                    is_centered = False
+                
                 error_magnitude = np.sqrt(ex**2 + ey**2)
-                is_centered = error_magnitude < self.state.centered_tolerance
                 self.state.ball_is_centered = is_centered
                 
                 # Detect mode transition for bumpless transfer
@@ -1851,9 +2000,12 @@ class ControlLoop:
             
             # Store data for plotting
             test_times.append(elapsed_time)
-            command_positions.append(self.state.x_target_filtered)
-            output_positions.append(x_pos)
-            control_signals.append(ux)
+            x_command_positions.append(self.state.x_target_filtered)
+            x_output_positions.append(x_pos)
+            x_control_signals.append(ux)
+            y_command_positions.append(self.state.y_target_filtered)
+            y_output_positions.append(y_pos)
+            y_control_signals.append(uy)
             
             # Update display
             frame = self.camera_manager.get_camera_frame()
@@ -1889,48 +2041,69 @@ class ControlLoop:
         
         # Create and save plot
         print("[RAMP TEST] Creating plot...")
-        self._create_ramp_test_plot(test_times, command_positions, output_positions, control_signals)
+        self._create_ramp_test_plot(test_times, 
+                                    x_command_positions, x_output_positions, x_control_signals,
+                                    y_command_positions, y_output_positions, y_control_signals,
+                                    self.state.Kp, self.state.Ki, self.state.Kd)
         
         self.state.running = False
     
-    def _create_ramp_test_plot(self, times, commands, outputs, controls):
+    def _create_ramp_test_plot(self, times, 
+                                x_commands, x_outputs, x_controls,
+                                y_commands, y_outputs, y_controls,
+                                Kp, Ki, Kd):
         """
         Create and save ramp test plot.
         
         Args:
             times: List of time values (seconds)
-            commands: List of command positions (meters)
-            outputs: List of output positions (meters)
-            controls: List of control signals
+            x_commands: List of X command positions (meters)
+            x_outputs: List of X output positions (meters)
+            x_controls: List of X control signals
+            y_commands: List of Y command positions (meters)
+            y_outputs: List of Y output positions (meters)
+            y_controls: List of Y control signals
+            Kp: Proportional gain
+            Ki: Integral gain
+            Kd: Derivative gain
         """
         # Create tmp directory if it doesn't exist
         import os
         os.makedirs("tmp", exist_ok=True)
         
-        # Create figure with 3 subplots
-        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-        fig.suptitle('Ramp Test Results', fontsize=14, fontweight='bold')
+        # Create figure with 6 subplots (3 for X, 3 for Y)
+        fig, axes = plt.subplots(6, 1, figsize=(12, 16), sharex=True)
+        fig.suptitle(f'Ramp Test Results | Kp={Kp:.3f}, Ki={Ki:.3f}, Kd={Kd:.3f}', 
+                     fontsize=14, fontweight='bold')
         
         # Convert to numpy arrays
         times_array = np.array(times)
-        outputs_array = np.array(outputs)
-        commands_array = np.array(commands)
-        controls_array = np.array(controls)
+        x_outputs_array = np.array(x_outputs)
+        x_commands_array = np.array(x_commands)
+        x_controls_array = np.array(x_controls)
+        y_outputs_array = np.array(y_outputs)
+        y_commands_array = np.array(y_commands)
+        y_controls_array = np.array(y_controls)
         
         # Clip data to start at 1 second
         mask = times_array >= 1.0
         times_array = times_array[mask]
-        outputs_array = outputs_array[mask]
-        commands_array = commands_array[mask]
-        controls_array = controls_array[mask]
+        x_outputs_array = x_outputs_array[mask]
+        x_commands_array = x_commands_array[mask]
+        x_controls_array = x_controls_array[mask]
+        y_outputs_array = y_outputs_array[mask]
+        y_commands_array = y_commands_array[mask]
+        y_controls_array = y_controls_array[mask]
         
-        # Calculate error
-        errors = commands_array - outputs_array
+        # Calculate errors
+        x_errors = x_commands_array - x_outputs_array
+        y_errors = y_commands_array - y_outputs_array
         
+        # X-AXIS PLOTS
         # Plot 1: X Ball Position and X Command Position (overlayed)
         ax1 = axes[0]
-        ax1.plot(times_array, commands_array, 'b-', linewidth=2, label='X Command', alpha=0.7)
-        ax1.plot(times_array, outputs_array, 'r-', linewidth=1.5, label='X Ball Position', alpha=0.8)
+        ax1.plot(times_array, x_commands_array, 'b-', linewidth=2, label='X Command', alpha=0.7)
+        ax1.plot(times_array, x_outputs_array, 'r-', linewidth=1.5, label='X Ball Position', alpha=0.8)
         ax1.set_ylabel('X Position (m)', fontweight='bold')
         ax1.set_title('X Position: Command vs Ball', fontweight='bold')
         ax1.grid(True, alpha=0.3)
@@ -1938,7 +2111,7 @@ class ControlLoop:
         
         # Plot 2: X Control Signal
         ax2 = axes[1]
-        ax2.plot(times_array, controls_array, 'g-', linewidth=1.5, label='X Control Signal')
+        ax2.plot(times_array, x_controls_array, 'g-', linewidth=1.5, label='X Control Signal')
         ax2.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
         ax2.set_ylabel('X Control Signal', fontweight='bold')
         ax2.set_title('X Control Signal', fontweight='bold')
@@ -1947,26 +2120,49 @@ class ControlLoop:
         
         # Plot 3: X Tracking Error
         ax3 = axes[2]
-        ax3.plot(times_array, errors, 'm-', linewidth=1.5, label='X Error (Command - Ball)')
+        ax3.plot(times_array, x_errors, 'm-', linewidth=1.5, label='X Error (Command - Ball)')
         ax3.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
-        ax3.set_xlabel('Time (s)', fontweight='bold')
         ax3.set_ylabel('X Error (m)', fontweight='bold')
         ax3.set_title('X Tracking Error', fontweight='bold')
         ax3.grid(True, alpha=0.3)
         ax3.legend(loc='upper right')
         
+        # Y-AXIS PLOTS
+        # Plot 4: Y Ball Position and Y Command Position (overlayed)
+        ax4 = axes[3]
+        ax4.plot(times_array, y_commands_array, 'b-', linewidth=2, label='Y Command', alpha=0.7)
+        ax4.plot(times_array, y_outputs_array, 'r-', linewidth=1.5, label='Y Ball Position', alpha=0.8)
+        ax4.set_ylabel('Y Position (m)', fontweight='bold')
+        ax4.set_title('Y Position: Command vs Ball', fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend(loc='upper right')
+        
+        # Plot 5: Y Control Signal
+        ax5 = axes[4]
+        ax5.plot(times_array, y_controls_array, 'g-', linewidth=1.5, label='Y Control Signal')
+        ax5.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
+        ax5.set_ylabel('Y Control Signal', fontweight='bold')
+        ax5.set_title('Y Control Signal', fontweight='bold')
+        ax5.grid(True, alpha=0.3)
+        ax5.legend(loc='upper right')
+        
+        # Plot 6: Y Tracking Error
+        ax6 = axes[5]
+        ax6.plot(times_array, y_errors, 'm-', linewidth=1.5, label='Y Error (Command - Ball)')
+        ax6.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
+        ax6.set_xlabel('Time (s)', fontweight='bold')
+        ax6.set_ylabel('Y Error (m)', fontweight='bold')
+        ax6.set_title('Y Tracking Error', fontweight='bold')
+        ax6.grid(True, alpha=0.3)
+        ax6.legend(loc='upper right')
+        
         plt.tight_layout()
         
-        # Save plot
+        # Save plot (PNG only)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"tmp/ramp_test_{timestamp}.png"
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"[RAMP TEST] Plot saved to: {filename}")
-        
-        # Also save as PDF for better quality
-        pdf_filename = f"tmp/ramp_test_{timestamp}.pdf"
-        plt.savefig(pdf_filename, bbox_inches='tight')
-        print(f"[RAMP TEST] Plot saved to: {pdf_filename}")
         
         plt.close(fig)
 
