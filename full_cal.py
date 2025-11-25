@@ -14,10 +14,11 @@ PREVIEW = False                 # undistort preview window
 JSON_OUTPUT = False             # print one-line JSON each frame
 MAX_PAIR_PX = None              # optional max pixel distance to accept screw pairs
 POINT_DIAMETER_M = 0.01        # expected point diameter in meters (1cm)
-WORKING_DISTANCE_M = 0.5       # estimated working distance in meters
+WORKING_DISTANCE_M = 0.3       # estimated working distance in meters
 POINT_SMOOTH_ALPHA = 0.3       # point smoothing factor (0-1)
-PAIR_SEP_M = None              # known physical separation (meters) between two screws in a pair
-PAIR_SEP_TOL = 0.4             # tolerance fraction for PAIR_SEP_M when filtering pairs
+PAIR_SEP_M = 0.07              # known physical separation (meters) between two screws in a pair (7cm)
+PAIR_SEP_TOL = 0.3             # tolerance fraction for PAIR_SEP_M when filtering pairs (±30%)
+MIN_CIRCULARITY = 0.7          # minimum circularity for screw blob detection (0-1, higher = more circular)
 
 # Coordinate frame storage (updated when motors stabilized)
 coordinate_frame = None
@@ -252,7 +253,7 @@ def detect_pairs_from_frame(frame, K, detector=None, point_diameter_m=POINT_DIAM
         est_area = estimate_pixel_area_for_size(point_diameter_m, K, working_distance_m)
         min_area = int(max(5, est_area * 0.3))
         max_area = int(max(20, est_area * 2.0))
-        detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
+        detector = make_blob_detector(min_area=min_area, max_area=max_area, dark=True)
 
     keypoints = detector.detect(blurred)
 
@@ -314,12 +315,15 @@ class PairDetector:
     Use process(frame) each loop to get smoothed img_pts and pairs.
     """
     def __init__(self, K, point_diameter_m=POINT_DIAMETER_M, working_distance_m=WORKING_DISTANCE_M,
-                 alpha=POINT_SMOOTH_ALPHA, detector=None, max_pair_px=MAX_PAIR_PX):
+                 alpha=POINT_SMOOTH_ALPHA, detector=None, max_pair_px=MAX_PAIR_PX,
+                 pair_sep_m=PAIR_SEP_M, pair_sep_tol=PAIR_SEP_TOL):
         self.K = K
         self.point_diameter_m = point_diameter_m
         self.working_distance_m = working_distance_m
         self.alpha = float(alpha)
         self.max_pair_px = max_pair_px
+        self.pair_sep_m = pair_sep_m
+        self.pair_sep_tol = pair_sep_tol
         self.detector = detector
         self.smoothed_midpoints = None
         self.smoothed_blobs = None
@@ -339,7 +343,7 @@ class PairDetector:
                     min_area, max_area = 50, 500
             else:
                 min_area, max_area = 50, 500
-            self.detector = make_blob_detector(min_area=min_area, max_area=max_area, min_circ=0.5, dark=True)
+            self.detector = make_blob_detector(min_area=min_area, max_area=max_area, dark=True)
 
         keypoints = self.detector.detect(blurred)
 
@@ -369,6 +373,19 @@ class PairDetector:
         img_pts = None
         if len(pts) >= 2:
             candidate_pairs = pair_points_by_distance(pts, expected_pairs=(len(pts) // 2), max_pair_px=self.max_pair_px)
+            
+            # Filter pairs by expected physical separation (e.g., 7cm between screws)
+            if self.pair_sep_m is not None and len(candidate_pairs) > 0 and self.K is not None:
+                fx = float(self.K[0, 0])
+                expected_px = (self.pair_sep_m * fx) / self.working_distance_m
+                tol_px = expected_px * self.pair_sep_tol
+                filtered_pairs = []
+                for a, b in candidate_pairs:
+                    d = float(np.linalg.norm(pts[int(a)] - pts[int(b)]))
+                    if abs(d - expected_px) <= tol_px:
+                        filtered_pairs.append((a, b))
+                candidate_pairs = filtered_pairs
+            
             if candidate_pairs:
                 midpts = []
                 blobs = []
@@ -406,13 +423,16 @@ def detect_pairs_from_frame(frame, K, detector=None, point_diameter_m=POINT_DIAM
     return pd.process(frame)
 
 
-def make_blob_detector(min_area=50, max_area=500, min_circ=0.5, dark=True, min_size=5, max_size=30):
+def make_blob_detector(min_area=50, max_area=500, min_circ=None, dark=True, min_size=5, max_size=30):
     """
-    Create blob detector tuned for ~1cm diameter points.
+    Create blob detector tuned for circular screw heads (~1cm diameter).
     min_area/max_area: pixel area range (more restrictive for 1cm points)
-    min_circ: minimum circularity (higher = more circular)
+    min_circ: minimum circularity (higher = more circular), defaults to MIN_CIRCULARITY
     min_size/max_size: blob diameter range in pixels
     """
+    if min_circ is None:
+        min_circ = MIN_CIRCULARITY
+    
     params = cv2.SimpleBlobDetector_Params()
     params.filterByArea = True
     params.minArea = float(min_area)
@@ -420,13 +440,11 @@ def make_blob_detector(min_area=50, max_area=500, min_circ=0.5, dark=True, min_s
     params.filterByCircularity = True
     params.minCircularity = float(min_circ)
     params.filterByInertia = True
-    params.minInertiaRatio = 0.5  # More circular
+    params.minInertiaRatio = 0.6  # More circular (increased from 0.5)
     params.filterByConvexity = True
-    params.minConvexity = 0.8  # More convex (rounder)
+    params.minConvexity = 0.85  # More convex/rounder (increased from 0.8)
     params.filterByColor = True
     params.blobColor = 0 if dark else 255
-    # Filter by size (diameter)
-    params.filterByArea = True  # Already set, but ensure it's on
     return cv2.SimpleBlobDetector_create(params)
 
 
@@ -559,7 +577,14 @@ def main():
         print(f"Point detection: {POINT_DIAMETER_M * 1000:.1f}mm diameter")
         print(f"  Estimated pixel diameter: {expected_diameter_px:.1f} px (range: {min_diameter_px:.1f}-{max_diameter_px:.1f} px)")
         print(f"  Estimated pixel area: {est_area:.1f} px (range: {min_area}-{max_area} px)")
+        print(f"  Minimum circularity: {MIN_CIRCULARITY:.2f}")
         print(f"  Point smoothing alpha: {POINT_SMOOTH_ALPHA:.2f}")
+        # Show pair separation constraint
+        if PAIR_SEP_M is not None:
+            expected_sep_px = (PAIR_SEP_M * fx) / WORKING_DISTANCE_M
+            tol_px = expected_sep_px * PAIR_SEP_TOL
+            print(f"Pair separation: {PAIR_SEP_M * 100:.1f}cm between screws")
+            print(f"  Expected pixel separation: {expected_sep_px:.1f} px (±{tol_px:.1f} px)")
     else:
         # Use default values when no calibration is available
         min_area = 50

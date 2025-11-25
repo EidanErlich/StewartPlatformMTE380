@@ -535,11 +535,19 @@ class CSVLogger:
 
 class PIDController:
     """
-    Simple PID controller.
+    PID controller with derivative-on-measurement option to avoid derivative kick.
+    
+    Features:
+    - Standard PID with P, I, D terms
+    - Anti-windup: Clamps integral term to prevent actuator saturation
+    - Derivative-on-measurement: Uses -d(measurement)/dt instead of d(error)/dt
+      to prevent derivative kick when setpoint changes (optional, off by default)
+    - Derivative filtering: Optional low-pass filter on derivative term
     """
     
     def __init__(self, Kp: float = 1.0, Ki: float = 0.0, Kd: float = 0.0,
-                 output_limit: float = 1.0):
+                 output_limit: float = 1.0, derivative_on_measurement: bool = False,
+                 derivative_filter_alpha: float = 1.0):
         """
         Initialize PID controller.
         
@@ -548,15 +556,24 @@ class PIDController:
             Ki: Integral gain
             Kd: Derivative gain
             output_limit: Maximum absolute value for PID output (saturation)
+            derivative_on_measurement: If True, use -d(measurement)/dt for D term
+                                      to avoid derivative kick on setpoint changes
+            derivative_filter_alpha: Low-pass filter coefficient for derivative (0-1)
+                                    Lower values = more filtering. 1.0 = no filtering.
         """
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
         self.output_limit = output_limit
+        self.derivative_on_measurement = derivative_on_measurement
+        self.derivative_filter_alpha = derivative_filter_alpha
         
         # Internal state
         self.integral = 0.0
         self.prev_error = 0.0
+        self.prev_measurement = 0.0
+        self.filtered_derivative = 0.0
+        self._first_update = True
         
     def update(self, error: float, measurement: float, dt: float) -> float:
         """
@@ -564,7 +581,7 @@ class PIDController:
         
         Args:
             error: Current error (setpoint - measurement)
-            measurement: Current measurement value (unused in simple version)
+            measurement: Current measurement value (used for derivative-on-measurement)
             dt: Time step in seconds
             
         Returns:
@@ -576,22 +593,38 @@ class PIDController:
         # Proportional term
         P = self.Kp * error
         
-        # Integral term
+        # Integral term with anti-windup
         self.integral += error * dt
-        I = self.Ki * self.integral
-        # Anti-windup: clamp the integral state so the I term cannot exceed the actuator limits
+        
+        # Anti-windup: clamp integral state so I term cannot exceed actuator limits
         if abs(self.Ki) > 1e-12:
             integral_limit = abs(self.output_limit) / abs(self.Ki)
             self.integral = np.clip(self.integral, -integral_limit, integral_limit)
             I = self.Ki * self.integral
         else:
-            # Ki is zero (or effectively zero) — ensure no accidental large integral contribution
+            # Ki is zero — prevent accidental integral contribution
             self.integral = 0.0
             I = 0.0
         
         # Derivative term
-        derivative = (error - self.prev_error) / dt
-        D = self.Kd * derivative
+        if self._first_update:
+            # First update - no valid derivative yet
+            raw_derivative = 0.0
+            self._first_update = False
+        elif self.derivative_on_measurement:
+            # Derivative-on-measurement: avoids derivative kick on setpoint changes
+            # Use negative of measurement derivative since error = setpoint - measurement
+            raw_derivative = -(measurement - self.prev_measurement) / dt
+        else:
+            # Standard derivative-on-error
+            raw_derivative = (error - self.prev_error) / dt
+        
+        # Apply low-pass filter to derivative to reduce noise sensitivity
+        self.filtered_derivative = (
+            self.derivative_filter_alpha * raw_derivative +
+            (1.0 - self.derivative_filter_alpha) * self.filtered_derivative
+        )
+        D = self.Kd * self.filtered_derivative
         
         # Compute output
         output = P + I + D
@@ -599,15 +632,35 @@ class PIDController:
         # Saturate output
         output = np.clip(output, -self.output_limit, self.output_limit)
         
-        # Update state
+        # Update state for next iteration
         self.prev_error = error
+        self.prev_measurement = measurement
         
         return output
+    
+    def update_state_only(self, error: float, measurement: float):
+        """
+        Update internal state without computing output.
+        Call this when in a deadband zone to keep state fresh and avoid
+        derivative kick when exiting the deadband.
+        
+        Args:
+            error: Current error
+            measurement: Current measurement
+        """
+        self.prev_error = error
+        self.prev_measurement = measurement
+        # Don't update integral - we're in deadband, don't accumulate
+        # Decay filtered derivative gently toward zero (reduces kick when exiting deadband)
+        self.filtered_derivative *= 0.95
     
     def reset(self):
         """Reset internal state."""
         self.integral = 0.0
         self.prev_error = 0.0
+        self.prev_measurement = 0.0
+        self.filtered_derivative = 0.0
+        self._first_update = True
     
     def set_gains(self, Kp: float, Ki: float, Kd: float):
         """Update PID gains."""
@@ -621,6 +674,16 @@ class TwiddleOptimizer:
     Coordinate Descent (Twiddle) optimizer for PID parameter tuning.
     Optimizes [Kp, Ki, Kd] by perturbing one parameter at a time.
     Note: TiltGain is excluded from optimization and should be set manually.
+    
+    Algorithm:
+    1. First call: Establish baseline cost with initial params
+    2. For each parameter:
+       a. Try params[i] += d_params[i] (positive perturbation)
+       b. If improved, keep it and increase step size
+       c. Else try params[i] -= 2*d_params[i] (negative perturbation)
+       d. If improved, keep it and increase step size
+       e. Else revert and shrink step size
+    3. Repeat until convergence
     """
     
     def __init__(self, initial_params: np.ndarray):
@@ -631,11 +694,11 @@ class TwiddleOptimizer:
             initial_params: Initial parameter vector [Kp, Ki, Kd]
         """
         self.params = np.array(initial_params, dtype=float)
+        self.initial_params = self.params.copy()  # Store for reference
         
         # Perturbation vector (how much to change params by initially)
         # Adjusted based on analysis: Kd needs more exploration (optimal ~0.30-0.35)
-        # Kd perturbation increased to encourage exploration of higher values
-        self.d_params = np.array([0.05, 0.01, 0.08], dtype=float)  # Increased Kd from 0.05 to 0.08
+        self.d_params = np.array([0.05, 0.02, 0.08], dtype=float)
         
         # Parameter bounds to prevent unsafe values
         self.param_bounds = np.array([
@@ -650,12 +713,23 @@ class TwiddleOptimizer:
         self.stage = 0  # 0=try positive, 1=try negative
         self.iteration = 0
         
+        # CRITICAL: Track whether baseline has been established
+        # First call to report_cost establishes baseline, then we start perturbing
+        self.baseline_established = False
+        
         # Exploration enhancement: track consecutive failures to detect local minima
         self.consecutive_failures = 0
         self.max_consecutive_failures = 5  # After 5 consecutive failures, boost exploration
         self.param_failure_count = [0, 0, 0]  # Track failures per parameter
         self.iterations_since_improvement = 0  # Track global stagnation
         self.max_iterations_without_improvement = 20  # After 20 iterations, force exploration
+        
+        # Convergence tracking
+        self.best_cost_history = []  # Track best cost over time
+        self.convergence_window = 10  # Number of iterations to check for convergence
+        self.convergence_tolerance = 0.001  # Relative improvement threshold (0.1%)
+        self.min_step_size = 0.001  # Minimum step size - if all below this, consider converged
+        self.param_change_history = []  # Track parameter changes for convergence detection
         
     def get_params(self) -> np.ndarray:
         """Get current parameter vector [Kp, Ki, Kd]."""
@@ -673,11 +747,26 @@ class TwiddleOptimizer:
         """
         self.iteration += 1
         
+        # CRITICAL FIX: Handle first call specially to establish baseline
+        # The first call is with unperturbed params - establish this as baseline
+        # Then start perturbing from parameter 0
+        if not self.baseline_established:
+            self.best_cost = cost
+            self.best_params = self.params.copy()
+            self.baseline_established = True
+            print(f"[TWIDDLE] Baseline established: Cost = {cost:.5f} with initial params")
+            print(f"[TWIDDLE] Starting optimization from parameter 0 (Kp)")
+            
+            # Now prepare the first perturbation (positive on param 0)
+            # Do NOT move to next parameter yet - we need to try perturbing param 0
+            self.current_param_idx = 0
+            self.stage = 0
+            return self.prepare_next_attempt()
+        
         if cost < self.best_cost:
             # Improvement found - keep the change
             self.best_cost = cost
             # Store the parameters that achieved this best cost
-            # Note: params are already updated with the perturbation, so they're the best
             self.best_params = self.params.copy()
             # Less aggressive growth to prevent overshooting (1.05 instead of 1.1)
             self.d_params[self.current_param_idx] *= 1.05
@@ -686,6 +775,16 @@ class TwiddleOptimizer:
             self.consecutive_failures = 0
             self.param_failure_count[self.current_param_idx] = 0
             self.iterations_since_improvement = 0
+            
+            # Track best cost history for convergence detection
+            self.best_cost_history.append(self.best_cost)
+            if len(self.best_cost_history) > self.convergence_window:
+                self.best_cost_history.pop(0)
+            
+            # Track parameter changes
+            self.param_change_history.append(self.params.copy())
+            if len(self.param_change_history) > self.convergence_window:
+                self.param_change_history.pop(0)
             
             # Move to next parameter
             self.current_param_idx = (self.current_param_idx + 1) % len(self.params)
@@ -778,9 +877,42 @@ class TwiddleOptimizer:
         
         return self.params.copy()
     
+    def check_convergence(self) -> Tuple[bool, str]:
+        """
+        Check if optimization has converged.
+        
+        Returns:
+            (converged: bool, reason: str)
+        """
+        if self.iteration < self.convergence_window:
+            return False, "Not enough iterations"
+        
+        # Check 1: Step sizes are too small
+        max_step = np.max(self.d_params)
+        if max_step < self.min_step_size:
+            return True, f"Step sizes converged (max={max_step:.6f} < {self.min_step_size:.6f})"
+        
+        # Check 2: No improvement in recent iterations
+        if len(self.best_cost_history) >= self.convergence_window:
+            recent_improvement = self.best_cost_history[0] - self.best_cost_history[-1]
+            relative_improvement = recent_improvement / (abs(self.best_cost_history[0]) + 1e-10)
+            if relative_improvement < self.convergence_tolerance:
+                return True, f"No significant improvement in {self.convergence_window} iterations " \
+                            f"(relative improvement: {relative_improvement*100:.3f}% < {self.convergence_tolerance*100:.3f}%)"
+        
+        # Check 3: Parameters haven't changed significantly
+        if len(self.param_change_history) >= self.convergence_window:
+            param_variance = np.var(self.param_change_history, axis=0)
+            max_variance = np.max(param_variance)
+            if max_variance < 0.0001:  # Parameters stable within 0.0001
+                return True, f"Parameters stabilized (max variance: {max_variance:.6f})"
+        
+        return False, "Still optimizing"
+    
     def get_status(self) -> dict:
         """Get current optimizer status for display."""
         param_names = ['Kp', 'Ki', 'Kd']  # TiltGain excluded from optimization
+        converged, convergence_reason = self.check_convergence()
         return {
             'params': self.params.copy(),
             'best_params': self.best_params.copy(),  # Best parameters found so far
@@ -788,7 +920,9 @@ class TwiddleOptimizer:
             'current_param': param_names[self.current_param_idx],
             'best_cost': self.best_cost,
             'iteration': self.iteration,
-            'd_params': self.d_params.copy()
+            'd_params': self.d_params.copy(),
+            'converged': converged,
+            'convergence_reason': convergence_reason
         }
 
 
@@ -815,18 +949,24 @@ class AutoTuner:
         # Episode configuration
         self.episode_duration = 5.0  # seconds
         self.stabilization_duration = 2.0  # seconds to wait for ball to center before test
+        self.required_stability_duration = 3.0  # seconds - ball must stay continuously on target for this long to validate
+        
+        # Stability tolerance: separate from centered_tolerance for the 3-second requirement
+        # Use a slightly larger tolerance (2.5cm) for the stability check to account for small oscillations
+        self.stability_tolerance = 0.025  # meters (2.5cm) - larger than centered_tolerance for stability requirement
         
         # Episode state
         self.is_tuning = False
         self.episode_start_time = None
         self.stabilization_start_time = None
+        self.stabilization_centered_start = None  # When ball became centered during STABILIZING
         self.episode_phase = "IDLE"  # IDLE, RECOVERING, STABILIZING, RUNNING, FINISHED
         
         # Active Recovery state
         self.recovery_start_time = None
         self.recovery_centered_start_time = None  # When ball first became centered
         self.recovery_hold_time = 2.0  # seconds - how long ball must stay centered
-        self.recovery_timeout = 10.0  # seconds - max time to recover ball
+        self.recovery_timeout = 60.0  # seconds - max time to recover ball (increased from 10s to allow more settling time)
         self.recovery_params = None  # Best-known PID params for recovery
         self.best_params_ever = None  # Store best parameters found so far
         self.best_cost_ever = float('inf')
@@ -838,27 +978,42 @@ class AutoTuner:
         self.prev_uy = 0.0
         self.time_elapsed = 0.0
         
+        # Consecutive time on target tracking
+        self.consecutive_time_on_target = 0.0  # Total consecutive time on target
+        self.consecutive_start_time = None  # When current consecutive period started
+        self.was_on_target = False  # Whether ball was on target in previous iteration
+        self.stability_requirement_met = False  # Whether ball achieved required stability duration
+        
+        # Settling time tracking (for cost function)
+        self.settling_time = None  # Time when stability requirement was first met
+        self.first_on_target_time = None  # Time when ball first reached target (rise time)
+        
         # Safety limits
-        self.max_error_safety = 0.15  # meters - abort if error exceeds this
+        self.max_error_safety = 0.15  # meters - abort if error exceeds this (15cm)
         self.max_tilt_safety = 10.0  # degrees - abort if tilt exceeds this
-        self.recovery_centered_threshold = 0.05  # meters - ball must be within 2cm to consider recovered
+        # Recovery threshold: ball must be within this distance of center to consider recovered
+        # Set to 2x the centered_tolerance for a forgiving recovery zone
+        self.recovery_centered_threshold = 0.03  # meters (3cm) - more forgiving than centered_tolerance
         
         # Cost function weights
         self.error_weight = 1.0  # Weight for ITAE term
         self.jitter_weight = 0.1  # Weight for control effort term
+        self.oscillation_penalty_weight = 2.0  # Weight for oscillation penalty (increased)
+        self.steady_state_error_weight = 0.5  # Weight for steady-state error
         
-        # Test maneuver: hybrid approach - cycle through fixed test points
-        # Covers all major directions for comprehensive testing
+        # Convergence tracking
+        self.stop_reason = None  # Why tuning stopped (None = still running)
+        self.cost_history = []  # Track costs for logging
+        self.settling_time_history = []  # Track settling times for logging
+        
+        # Test maneuver: cycle through 4 cardinal directions
+        # Tests X and Y axes independently for faster evaluation
         # All points at 5cm radius for consistent evaluation
         self.test_points = [
-            (0.05, 0.0),           # East
-            (0.035355, -0.035355), # Southeast
-            (0.0, -0.05),          # South
-            (-0.035355, -0.035355),# Southwest
-            (-0.05, 0.0),          # West
-            (-0.035355, 0.035355), # Northwest
-            (0.0, 0.05),           # North
-            (0.035355, 0.035355),  # Northeast
+            (0.05, 0.0),    # East (tests +X axis)
+            (0.0, -0.05),   # South (tests -Y axis)
+            (-0.05, 0.0),   # West (tests -X axis)
+            (0.0, 0.05),    # North (tests +Y axis)
         ]
 
         self.test_point_idx = 0  # Current test point index (0-7)
@@ -872,6 +1027,8 @@ class AutoTuner:
         # Episode statistics
         self.episode_count = 0
         self.last_cost = None
+        self.last_settling_time = None
+        self.last_stability_met = False
     
     def start_tuning(self):
         """Start the auto-tuning process."""
@@ -898,18 +1055,40 @@ class AutoTuner:
             self.best_params_ever = opt_status['best_params'].copy()
             self.best_cost_ever = opt_status['best_cost']
         self.recovery_params = self.best_params_ever.copy()
-        print("[AUTOTUNER] Starting auto-tuning with comprehensive evaluation (all 8 test points per parameter set)...")
+        print("[AUTOTUNER] Starting auto-tuning with 4 test points per parameter set (cardinal directions)...")
         # Start with recovery to ensure ball is centered
         self.start_recovery()
     
-    def stop_tuning(self):
-        """Stop the auto-tuning process."""
+    def stop_tuning(self, reason: str = "Manual stop"):
+        """
+        Stop the auto-tuning process.
+        
+        Args:
+            reason: Reason why tuning stopped (for logging)
+        """
         if not self.is_tuning:
             return
         
         self.is_tuning = False
         self.episode_phase = "IDLE"
-        print("[AUTOTUNER] Auto-tuning stopped")
+        self.stop_reason = reason
+        
+        # Log final statistics
+        opt_status = self.optimizer.get_status()
+        print(f"[AUTOTUNER] Auto-tuning stopped: {reason}")
+        print(f"[AUTOTUNER] Final statistics:")
+        print(f"  Total episodes: {self.episode_count}")
+        print(f"  Best cost: {opt_status['best_cost']:.5f}")
+        print(f"  Best parameters: Kp={opt_status['best_params'][0]:.5f}, "
+              f"Ki={opt_status['best_params'][1]:.5f}, Kd={opt_status['best_params'][2]:.5f}")
+        print(f"  Total iterations: {opt_status['iteration']}")
+        if self.cost_history:
+            print(f"  Cost range: {np.min(self.cost_history):.5f} - {np.max(self.cost_history):.5f}")
+        if self.settling_time_history:
+            successful = [t for t in self.settling_time_history if t is not None]
+            if successful:
+                print(f"  Successful settling times: {len(successful)}/{len(self.settling_time_history)} "
+                      f"(avg: {np.mean(successful):.2f}s, min: {np.min(successful):.2f}s)")
     
     def start_episode(self):
         """Start a new tuning episode."""
@@ -919,7 +1098,7 @@ class AutoTuner:
         self.state.x_target = 0.0
         self.state.y_target = 0.0
         
-        # Check if we need a new parameter set (after testing all 8 points)
+        # Check if we need a new parameter set (after testing all 4 points)
         if self.test_points_completed >= len(self.test_points):
             # All test points completed for current parameter set
             # Report averaged cost to optimizer and get new parameters
@@ -939,6 +1118,13 @@ class AutoTuner:
                 print(f"[AUTOTUNER] New best cost: {self.best_cost_ever:.5f} with params: "
                       f"Kp={self.best_params_ever[0]:.5f}, Ki={self.best_params_ever[1]:.5f}, "
                       f"Kd={self.best_params_ever[2]:.5f}")
+            
+            # Check for convergence
+            if opt_status.get('converged', False):
+                convergence_reason = opt_status.get('convergence_reason', 'Unknown')
+                print(f"[AUTOTUNER] Optimization converged: {convergence_reason}")
+                self.stop_tuning(f"Converged: {convergence_reason}")
+                return
             
             # Reset for new parameter set
             new_params = next_params
@@ -987,9 +1173,40 @@ class AutoTuner:
         self.prev_uy = 0.0
         self.time_elapsed = 0.0
         
+        # Reset consecutive time on target tracking
+        self.consecutive_time_on_target = 0.0
+        self.consecutive_start_time = None
+        self.was_on_target = False
+        self.stability_requirement_met = False
+        
+        # Settling time tracking (for cost function)
+        self.settling_time = None  # Time when stability requirement was first met
+        self.first_on_target_time = None  # Time when ball first reached target (rise time)
+        
+        # Reset stabilization tracking
+        self.stabilization_centered_start = None
+        
         status = self.optimizer.get_status()
         print(f"[AUTOTUNER] Episode {self.episode_count}: Test point {self.test_points_completed + 1}/{len(self.test_points)} "
               f"for param set (Kp={new_params[0]:.5f}, Ki={new_params[1]:.5f}, Kd={new_params[2]:.5f})")
+    
+    def _start_running_phase(self):
+        """
+        Transition from STABILIZING to RUNNING phase.
+        Helper method to start the actual test maneuver.
+        """
+        current_time = time.time()
+        self.episode_phase = "RUNNING"
+        self.episode_start_time = current_time
+        
+        # Use current test point (will increment after completion)
+        current_test_idx = self.test_point_idx
+        test_x, test_y = self.test_points[current_test_idx]
+        self.state.x_target = test_x
+        self.state.y_target = test_y
+        
+        print(f"[AUTOTUNER] Starting test maneuver: step to ({test_x:.5f}, {test_y:.5f})m "
+              f"(test point {current_test_idx + 1}/{len(self.test_points)})")
     
     def start_recovery(self):
         """Start active recovery phase using best-known PID parameters."""
@@ -1053,7 +1270,7 @@ class AutoTuner:
                 if recovery_elapsed > self.recovery_timeout:
                     print(f"[AUTOTUNER] RECOVERY FAILED: Ball not detected after {self.recovery_timeout:.1f}s")
                     print("[AUTOTUNER] ABORTING TUNING - Human intervention required")
-                    self.stop_tuning()
+                    self.stop_tuning("Recovery timeout - ball not detected")
                     return
                 # Continue trying to recover
                 return
@@ -1087,35 +1304,41 @@ class AutoTuner:
                     print(f"[AUTOTUNER] RECOVERY FAILED: Ball not centered after {self.recovery_timeout:.1f}s")
                     print(f"[AUTOTUNER] Current error: {error_magnitude:.4f}m, threshold: {self.recovery_centered_threshold:.4f}m")
                     print("[AUTOTUNER] ABORTING TUNING - Human intervention required")
-                    self.stop_tuning()
+                    self.stop_tuning("Recovery timeout - ball not centered")
                     return
                 # Continue recovery
                 return
         
         if self.episode_phase == "STABILIZING":
-            # Wait for ball to stabilize at center
-            if current_time - self.stabilization_start_time < self.stabilization_duration:
-                # Check if ball is centered (within tolerance)
-                if error_magnitude < self.state.centered_tolerance:
-                    # Ball is centered, can proceed
-                    pass
-                else:
-                    # Still waiting for stabilization
+            # Wait for ball to stabilize at center for consecutive duration
+            # This ensures a clean starting state before each test maneuver
+            stabilization_elapsed = current_time - self.stabilization_start_time
+            
+            # Check if ball is centered (within tolerance)
+            if error_magnitude < self.state.centered_tolerance:
+                # Ball is currently centered
+                if self.stabilization_centered_start is None:
+                    # Ball just became centered - start tracking
+                    self.stabilization_centered_start = current_time
+                
+                # Check how long ball has been continuously centered
+                centered_duration = current_time - self.stabilization_centered_start
+                
+                if centered_duration >= self.stabilization_duration:
+                    # Ball has been centered for required duration - proceed to test
+                    print(f"[AUTOTUNER] Stabilization complete: Ball centered for {centered_duration:.2f}s")
+                    self._start_running_phase()
                     return
             else:
-                # Stabilization timeout - proceed anyway
-                pass
+                # Ball is not centered - reset the centered timer
+                if self.stabilization_centered_start is not None:
+                    self.stabilization_centered_start = None
             
-            # Start the test maneuver - use current test point
-            self.episode_phase = "RUNNING"
-            self.episode_start_time = current_time
-            # Use current test point (will increment after completion)
-            current_test_idx = self.test_point_idx
-            test_x, test_y = self.test_points[current_test_idx]
-            self.state.x_target = test_x
-            self.state.y_target = test_y
-            print(f"[AUTOTUNER] Starting test maneuver: step to ({test_x:.5f}, {test_y:.5f})m "
-                  f"(test point {current_test_idx + 1}/{len(self.test_points)})")
+            # Check for stabilization timeout (max 10 seconds to stabilize)
+            if stabilization_elapsed > 10.0:
+                print(f"[AUTOTUNER] STABILIZATION TIMEOUT: Could not stabilize after {stabilization_elapsed:.1f}s")
+                print(f"[AUTOTUNER] Proceeding with test anyway (current error: {error_magnitude:.4f}m)")
+                self._start_running_phase()
             return
         
         elif self.episode_phase == "RUNNING":
@@ -1125,11 +1348,63 @@ class AutoTuner:
             
             self.time_elapsed = current_time - self.episode_start_time
             
-            # ITAE: Integral Time-weighted Absolute Error
-            # Penalize errors that persist over time more heavily
-            self.accumulated_error += (self.time_elapsed * error_magnitude) * dt
+            # Check if ball is currently on target (use stability_tolerance for the 3s requirement)
+            # This is slightly more forgiving than centered_tolerance to account for small oscillations
+            is_on_target = error_magnitude < self.stability_tolerance
             
-            # Control effort (jitter): penalize rapid control changes
+            # Track first time ball reaches target (rise time)
+            if is_on_target and self.first_on_target_time is None:
+                self.first_on_target_time = self.time_elapsed
+            
+            # Track consecutive time on target (resets if ball leaves)
+            # IMPORTANT: This tracks CONSECUTIVE time, not cumulative.
+            # If ball leaves target even briefly, the timer resets to 0.
+            # The ball must stay continuously on target for required_stability_duration seconds.
+            if is_on_target:
+                if self.was_on_target:
+                    # Ball was already on target - continue accumulating consecutive time
+                    if self.consecutive_start_time is not None:
+                        self.consecutive_time_on_target = current_time - self.consecutive_start_time
+                    else:
+                        # Edge case: should start tracking now
+                        self.consecutive_start_time = current_time
+                        self.consecutive_time_on_target = 0.0
+                else:
+                    # Ball just arrived on target - start new consecutive period
+                    self.consecutive_start_time = current_time
+                    self.consecutive_time_on_target = 0.0
+                    self.was_on_target = True
+                
+                # Check if stability requirement is met (3 seconds consecutive on target)
+                if not self.stability_requirement_met and self.consecutive_time_on_target >= self.required_stability_duration:
+                    self.stability_requirement_met = True
+                    # Record settling time (time from episode start to stability achieved)
+                    self.settling_time = self.time_elapsed
+                    print(f"[AUTOTUNER] Stability requirement MET: Ball stable for {self.consecutive_time_on_target:.2f}s "
+                          f"(settling time: {self.settling_time:.2f}s)")
+            else:
+                # Ball is not on target - reset consecutive tracking
+                # CRITICAL: Reset timer to ensure consecutive (not cumulative) tracking
+                if self.was_on_target:
+                    # Ball just left target - completely reset the consecutive timer
+                    self.consecutive_start_time = None
+                    self.consecutive_time_on_target = 0.0
+                    # Note: We do NOT reset stability_requirement_met once achieved
+                    # The settling time has been recorded - leaving target after is just oscillation
+                self.was_on_target = False
+            
+            # Accumulate error cost (ITAE - penalizes errors that persist over time)
+            # Only accumulate while NOT stable (before settling)
+            if not self.stability_requirement_met:
+                # Ball hasn't settled yet - accumulate error cost
+                self.accumulated_error += (self.time_elapsed * error_magnitude) * dt
+            else:
+                # After settling, track steady-state error (oscillation penalty)
+                # This penalizes oscillations even after "settling"
+                steady_state_error = error_magnitude
+                self.accumulated_error += steady_state_error * dt * self.steady_state_error_weight
+            
+            # Control effort (jitter): always penalize rapid control changes
             jitter_x = abs(control_x - self.prev_ux)
             jitter_y = abs(control_y - self.prev_uy)
             jitter_magnitude = np.sqrt(jitter_x**2 + jitter_y**2)
@@ -1138,11 +1413,70 @@ class AutoTuner:
             self.prev_ux = control_x
             self.prev_uy = control_y
             
-            # Check if episode duration reached
-            if self.time_elapsed >= self.episode_duration:
-                # Calculate total cost
-                total_cost = (self.error_weight * self.accumulated_error + 
-                             self.jitter_weight * self.accumulated_jitter)
+            # Check if episode should complete:
+            # Option 1: Fixed duration reached
+            # Option 2: Stability achieved and we can end early (save time during tuning)
+            fixed_duration_complete = self.time_elapsed >= self.episode_duration
+            early_completion = (self.stability_requirement_met and 
+                               self.time_elapsed >= self.required_stability_duration + 1.0)  # +1s buffer
+            
+            if fixed_duration_complete or early_completion:
+                # Calculate final consecutive time on target
+                if is_on_target and self.consecutive_start_time is not None:
+                    final_consecutive_time = current_time - self.consecutive_start_time
+                    if final_consecutive_time >= self.required_stability_duration:
+                        self.stability_requirement_met = True
+                        if self.settling_time is None:
+                            self.settling_time = self.time_elapsed
+                else:
+                    final_consecutive_time = 0.0
+                
+                # Calculate total cost - GOAL: Minimize settling time
+                # Primary: settling time (or max penalty if never settled)
+                # Secondary: ITAE for transient response quality
+                # Tertiary: Control effort (jitter)
+                
+                if self.stability_requirement_met and self.settling_time is not None:
+                    # SUCCESS: Stability achieved
+                    # Cost is primarily the settling time (faster = better)
+                    settling_cost = self.settling_time * 10.0  # Weight settling time heavily
+                    
+                    # Calculate oscillation penalty: how much did ball oscillate after settling?
+                    # Track how many times ball left target after settling
+                    oscillation_penalty = 0.0
+                    if not is_on_target or final_consecutive_time < self.required_stability_duration:
+                        # Ball is oscillating - penalize based on how far from target
+                        oscillation_penalty = self.oscillation_penalty_weight * error_magnitude * 10.0
+                    
+                    # Steady-state error: average error after settling (already accumulated)
+                    steady_state_error_cost = self.accumulated_error * self.steady_state_error_weight
+                    
+                    total_cost = (settling_cost + 
+                                 self.error_weight * self.accumulated_error * 0.5 +  # Reduced weight for transient
+                                 self.jitter_weight * self.accumulated_jitter +
+                                 oscillation_penalty +
+                                 steady_state_error_cost)
+                    
+                    print(f"[AUTOTUNER] Episode SUCCESS - Settling time: {self.settling_time:.2f}s, "
+                          f"Final consecutive: {final_consecutive_time:.2f}s, "
+                          f"Oscillation penalty: {oscillation_penalty:.2f}")
+                else:
+                    # FAILURE: Never achieved stability
+                    # Large penalty proportional to how far we were from achieving it
+                    failure_penalty = 100.0 + (self.episode_duration - final_consecutive_time) * 50.0
+                    
+                    total_cost = (failure_penalty +
+                                 self.error_weight * self.accumulated_error +
+                                 self.jitter_weight * self.accumulated_jitter)
+                    
+                    rise_time_str = f"{self.first_on_target_time:.2f}s" if self.first_on_target_time else "never"
+                    print(f"[AUTOTUNER] Episode FAILED - Rise time: {rise_time_str}, "
+                          f"Max consecutive: {final_consecutive_time:.2f}s / {self.required_stability_duration:.2f}s required")
+                
+                # Store final consecutive time for logging
+                self.consecutive_time_on_target = final_consecutive_time
+                self.last_settling_time = self.settling_time
+                self.last_stability_met = self.stability_requirement_met
                 self.finish_episode(total_cost)
         
         elif self.episode_phase == "FINISHED":
@@ -1163,12 +1497,22 @@ class AutoTuner:
         self.accumulated_costs.append(cost)
         self.test_points_completed += 1
         
+        # Track cost and settling time for logging
+        self.cost_history.append(cost)
+        self.settling_time_history.append(self.settling_time)
+        if len(self.cost_history) > 100:  # Keep last 100 entries
+            self.cost_history.pop(0)
+            self.settling_time_history.pop(0)
+        
         if cost == float('inf'):
             print(f"[AUTOTUNER] Test point {self.test_points_completed}/{len(self.test_points)} FAILED (safety abort)")
         else:
+            stability_status = "SETTLED" if self.stability_requirement_met else "NOT SETTLED"
+            settling_str = f"{self.settling_time:.2f}s" if self.settling_time is not None else "N/A"
+            rise_str = f"{self.first_on_target_time:.2f}s" if self.first_on_target_time is not None else "N/A"
             print(f"[AUTOTUNER] Test point {self.test_points_completed}/{len(self.test_points)} complete: "
-                  f"Cost={cost:.5f} (error={self.accumulated_error:.5f}, "
-                  f"jitter={self.accumulated_jitter:.5f})")
+                  f"Cost={cost:.5f} | Rise={rise_str} | Settle={settling_str} | "
+                  f"Status: {stability_status}")
         
         # Move to next test point for next episode
         self.test_point_idx = (self.test_point_idx + 1) % len(self.test_points)
@@ -1217,6 +1561,7 @@ class AutoTuner:
             'recovery_time': recovery_time,
             'recovery_centered_duration': centered_duration,
             'recovery_hold_time': self.recovery_hold_time,
+            'recovery_timeout': self.recovery_timeout,
             'current_param': opt_status['current_param'],
             'best_cost': opt_status['best_cost'],
             'iteration': opt_status['iteration'],
@@ -1225,7 +1570,10 @@ class AutoTuner:
             'accumulated_jitter': self.accumulated_jitter,
             'test_points_completed': self.test_points_completed,
             'total_test_points': len(self.test_points),
-            'avg_cost_current_set': np.mean(self.accumulated_costs) if self.accumulated_costs else None
+            'avg_cost_current_set': np.mean(self.accumulated_costs) if self.accumulated_costs else None,
+            'settling_time': self.settling_time,
+            'first_on_target_time': self.first_on_target_time,
+            'stability_requirement_met': self.stability_requirement_met
         }
 
 
@@ -2225,7 +2573,7 @@ class UIManager:
                 )
                 y_offset += 20
                 # Show parameter set evaluation progress
-                test_progress = f"Test points: {tuner_status.get('test_points_completed', 0)}/{tuner_status.get('total_test_points', 8)}"
+                test_progress = f"Test points: {tuner_status.get('test_points_completed', 0)}/{tuner_status.get('total_test_points', 4)}"
                 if tuner_status.get('avg_cost_current_set') is not None:
                     test_progress += f" | Avg: {tuner_status['avg_cost_current_set']:.5f}"
                 cv2.putText(
@@ -2275,7 +2623,8 @@ class UIManager:
                         color = (0, 255, 0) if progress > 0.8 else (0, 255, 255)
                     else:
                         # Ball not centered yet
-                        status_text = f"RECOVERY: {recovery_time:.2f}s (max {10.0:.1f}s) - Centering..."
+                        max_time = tuner_status.get('recovery_timeout', 60.0)
+                        status_text = f"RECOVERY: {recovery_time:.2f}s (max {max_time:.1f}s) - Centering..."
                         color = (0, 255, 255)  # Yellow
                     
                     cv2.putText(
@@ -2520,11 +2869,14 @@ class ControlLoop:
                 self.state.ball_is_centered = is_centered
                 
                 # Update PID controllers
-                # If ball is centered (within tolerance), output zero
+                # If ball is centered (within tolerance), output zero but keep PID state fresh
                 if is_centered:
                     # Ball is centered - set outputs to zero
                     ux = 0.0
                     uy = 0.0
+                    # IMPORTANT: Keep PID state fresh to avoid derivative kick when exiting deadband
+                    self.pid_x.update_state_only(ex, x)
+                    self.pid_y.update_state_only(ey, y)
                 else:
                     # Ball is not centered - normal PID control
                     ux = self.pid_x.update(ex, x, dt)
@@ -2574,6 +2926,19 @@ class ControlLoop:
                 ux = 0.0
                 uy = 0.0
                 self.state.ball_is_centered = False
+                
+                # CRITICAL: Still update auto-tuner so recovery timeout works correctly
+                # The auto-tuner checks self.state.ball_position internally
+                if self.state.auto_tuning_enabled:
+                    self.auto_tuner.update(
+                        error_x=0.0,
+                        error_y=0.0,
+                        control_x=0.0,
+                        control_y=0.0,
+                        tilt_angle=0.0,
+                        dt=dt
+                    )
+                    self.state.auto_tuner_status = self.auto_tuner.get_status()
             
             # Log measured values to CSV (every 5 iterations to reduce I/O overhead)
             # Critical for performance - disk I/O is slow
