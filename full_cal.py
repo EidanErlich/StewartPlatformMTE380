@@ -145,8 +145,7 @@ class StewartPlatformCalibrator:
 
         print("[INFO] Stewart Platform Calibration")
         print("Phase 1: Click on the ball to sample color. Press 'c' when done.")
-        print("Phase 2: Ensure platform is visible. Press 'p' to detect the platform radius.")
-        print("Enter platform radius (m) when prompted.")
+        print("Phase 2: Platform will be auto-configured from motor position.")
         print("Press 's' to save. Press 'q' to quit.")
 
         while True:
@@ -183,51 +182,36 @@ class StewartPlatformCalibrator:
                 break
             elif key == ord('c') and self.phase == "color":
                 self.phase = "platform"
-                print("[INFO] Color calibration done. Press 'p' to detect platform.")
-            elif key == ord('p') and self.phase == "platform":
-                # For this flow we expect the coordinate_frame (origin & axes) to have been
-                # computed beforehand (outside this class). We still use Hough to get a
-                # reliable pixel radius (r) but we DO NOT use the Hough center; instead
-                # we project the externally-computed origin into image pixels and use
-                # that as the platform center.
+                print("[INFO] Color calibration done. Checking for pre-computed platform data...")
+                
+                # Try to load pre-computed platform configuration from coordinate_frame
                 global coordinate_frame
-                if coordinate_frame is None:
-                    print("[WARN] No precomputed coordinate frame found. Compute origin first, then re-run this step.")
-                    continue
+                if coordinate_frame is not None and coordinate_frame.get('pixel_to_meter_ratio') is not None:
+                    try:
+                        # Load platform data from coordinate_frame
+                        self.pixel_to_meter_ratio = coordinate_frame.get('pixel_to_meter_ratio')
+                        origin_px = np.array(coordinate_frame.get('origin_px'), dtype=np.float64)
+                        self.platform_center_px = (int(round(origin_px[0])), int(round(origin_px[1])))
+                        
+                        # Use motor radius as platform radius
+                        avg_radius_px = coordinate_frame.get('avg_radius_px')
+                        self.platform_diameter_px = int(round(2.0 * avg_radius_px))
+                        self.platform_radius_m = coordinate_frame.get('known_radius_m')
+                        
+                        print(f"[PLATFORM] Auto-loaded platform from coordinate_frame:")
+                        print(f"  Center: {self.platform_center_px}")
+                        print(f"  Diameter: {self.platform_diameter_px} px")
+                        print(f"  Radius: {self.platform_radius_m} m")
+                        print(f"  Pixel-to-meter ratio: {self.pixel_to_meter_ratio:.6f} m/px")
+                        
+                        self.phase = "complete"
+                        print("[INFO] Platform automatically configured. Press 's' to save.")
+                    except Exception as ex:
+                        print(f"[WARN] Could not auto-load platform data: {ex}")
+                        print("[INFO] Press 'p' to manually detect platform.")
+                else:
+                    print("[INFO] No pre-computed platform data found. Press 'p' to detect platform.")
 
-                # try to detect a circle to obtain a pixel radius (we'll override center)
-                result = self.detect_platform_circle(frame)
-                if result is None:
-                    print("[WARN] Could not detect a platform circle to obtain pixel radius. Adjust view or lighting.")
-                    continue
-
-                _, _, r = result
-                print(f"[PLATFORM] Detected radius={r}px (Hough). Using precomputed origin as center.)")
-
-                # ask user for real-world platform radius in meters (keeps previous UX)
-                try:
-                    self.platform_radius_m = float(input("Enter platform radius in meters: "))
-                except Exception:
-                    print("Invalid radius input; try again.")
-                    continue
-
-                # compute pixel-to-meter ratio from measured pixel radius
-                try:
-                    self.pixel_to_meter_ratio = float(self.platform_radius_m) / float(r)
-                    self.platform_diameter_px = int(round(2.0 * float(r)))
-                except Exception:
-                    print("[ERROR] Could not compute pixel-to-meter ratio from radius. Check inputs.")
-                    continue
-
-                # Project the precomputed origin (in pixel coords) to use as platform center
-                try:
-                    K, _ = load_camera_calib()
-                    origin_px = np.array(coordinate_frame.get('origin_px'), dtype=np.float64)
-                    self.platform_center_px = (int(round(origin_px[0])), int(round(origin_px[1])))
-                    print(f"[PLATFORM] Using origin as platform center: ({self.platform_center_px[0]},{self.platform_center_px[1]})")
-                    self.phase = "complete"
-                except Exception as ex:
-                    print(f"[ERROR] Failed using origin as platform center: {ex}")
             elif key == ord('s') and self.phase == "complete":
                 self.save_config()
                 break
@@ -856,6 +840,23 @@ def main():
 
             # centroid origin in pixels
             origin_px = (pos_px['A'] + pos_px['B'] + pos_px['C']) / 3.0
+            
+            # Calculate average distance from center to the three motors (in pixels)
+            dist_A = np.linalg.norm(pos_px['A'] - origin_px)
+            dist_B = np.linalg.norm(pos_px['B'] - origin_px)
+            dist_C = np.linalg.norm(pos_px['C'] - origin_px)
+            avg_radius_px = (dist_A + dist_B + dist_C) / 3.0
+            
+            # Known physical distance from center to motors (in meters)
+            known_radius_m = 0.14
+            
+            # Calculate pixel-to-meter ratio
+            pixel_to_meter_ratio = known_radius_m / avg_radius_px
+            
+            print(f"[CALIBRATION] Average radius to motors: {avg_radius_px:.2f} px")
+            print(f"[CALIBRATION] Known physical radius: {known_radius_m} m")
+            print(f"[CALIBRATION] Pixel-to-meter ratio: {pixel_to_meter_ratio:.6f} m/px")
+            
             # X axis toward Motor A from origin
             x_axis = pos_px['A'] - origin_px
             x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-12)
@@ -868,6 +869,9 @@ def main():
                 'origin_px': origin_px.tolist(),
                 'x_axis': x_axis.tolist(),
                 'y_axis': y_axis.tolist(),
+                'pixel_to_meter_ratio': pixel_to_meter_ratio,
+                'avg_radius_px': avg_radius_px,
+                'known_radius_m': known_radius_m,
                 'timestamp': float(t_now)
             }
             print("Coordinate system stored (in pixels):")
@@ -887,9 +891,28 @@ def main():
                     cfg = {}
 
                 cfg['coordinate_frame'] = coordinate_frame
+                
+                # Also update platform configuration using the computed values
+                # Estimate platform radius as slightly larger than motor radius (typical for Stewart platforms)
+                # For now, use the motor radius as the platform radius (can be adjusted based on actual platform)
+                platform_radius_px = avg_radius_px
+                platform_radius_m = known_radius_m
+                
+                cfg['platform'] = {
+                    'center_px': [int(round(origin_px[0])), int(round(origin_px[1]))],
+                    'diameter_px': int(round(2.0 * platform_radius_px)),
+                    'radius_m': platform_radius_m,
+                    'pixel_to_meter_ratio': pixel_to_meter_ratio
+                }
+                
+                print(f"[PLATFORM] Auto-configured platform:")
+                print(f"  Center: ({int(round(origin_px[0]))}, {int(round(origin_px[1]))})")
+                print(f"  Diameter: {int(round(2.0 * platform_radius_px))} px")
+                print(f"  Radius: {platform_radius_m} m")
+                
                 with open(cfg_path, 'w') as f:
                     json.dump(cfg, f, indent=2)
-                print(f"[SAVE] coordinate_frame written to {cfg_path}")
+                print(f"[SAVE] coordinate_frame and platform written to {cfg_path}")
             except Exception as ex:
                 print(f"[WARN] Failed to write coordinate_frame to config.json: {ex}")
 
