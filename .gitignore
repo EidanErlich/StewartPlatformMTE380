@@ -25,3 +25,7 @@ env/
 .pio/
 
 config.json
+
+logs/
+tmp/
+Runs/

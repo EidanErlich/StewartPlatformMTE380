@@ -72,7 +72,7 @@ from inverseKinematics import StewartPlatform
 class LivePlotter:
     """
     Real-time plotter for PID tuning visualization.
-    Plots magnitude of position/error and 2D control vector for last 10 seconds.
+    Plots magnitude of position/error, PID integral values, and control outputs for last 10 seconds.
     """
     
     def __init__(self, window_size: float = 10.0):
@@ -94,6 +94,8 @@ class LivePlotter:
         self.y_outputs = deque(maxlen=1000)
         self.x_targets = deque(maxlen=1000)
         self.y_targets = deque(maxlen=1000)
+        self.x_integrals = deque(maxlen=1000)
+        self.y_integrals = deque(maxlen=1000)
         
         # Start time reference
         self.start_time = time.time()
@@ -135,15 +137,13 @@ class LivePlotter:
         self.ax_trajectory.grid(True, alpha=0.3)
         self.ax_trajectory.set_aspect('equal', adjustable='box')
         
-        # Row 1: Control vector field (quiver plot showing recent control directions)
-        self.ax_control_vector = self.fig.add_subplot(gs[1, 1])
-        self.ax_control_vector.set_title('Control Vector History', fontweight='bold')
-        self.ax_control_vector.set_xlabel('X Output')
-        self.ax_control_vector.set_ylabel('Y Output')
-        self.ax_control_vector.grid(True, alpha=0.3)
-        self.ax_control_vector.axhline(0, color='k', linewidth=0.5)
-        self.ax_control_vector.axvline(0, color='k', linewidth=0.5)
-        self.ax_control_vector.set_aspect('equal', adjustable='box')
+        # Row 1: PID Integral over time
+        self.ax_integral = self.fig.add_subplot(gs[1, 1])
+        self.ax_integral.set_title('PID Integral', fontweight='bold')
+        self.ax_integral.set_xlabel('Time (s)')
+        self.ax_integral.set_ylabel('Integral Value')
+        self.ax_integral.grid(True, alpha=0.3)
+        self.ax_integral.axhline(0, color='k', linewidth=0.5)
         
         # Row 1: Component breakdown (X vs Y outputs stacked)
         self.ax_components = self.fig.add_subplot(gs[1, 2])
@@ -164,8 +164,10 @@ class LivePlotter:
         self.lines['target_pos'] = self.ax_trajectory.scatter([], [], c='green', s=150, marker='*', label='Target', zorder=5)
         self.ax_trajectory.legend(loc='upper right', fontsize=8)
         
-        # Control vector scatter (color-coded by time)
-        self.control_scatter = self.ax_control_vector.scatter([], [], c=[], cmap='viridis', s=30, alpha=0.6)
+        # Integral lines
+        self.lines['x_integral'], = self.ax_integral.plot([], [], 'r-', linewidth=1.5, alpha=0.7, label='X Integral')
+        self.lines['y_integral'], = self.ax_integral.plot([], [], 'g-', linewidth=1.5, alpha=0.7, label='Y Integral')
+        self.ax_integral.legend(loc='upper right', fontsize=8)
         
         # Component lines
         self.lines['x_output'], = self.ax_components.plot([], [], 'r-', linewidth=1.5, alpha=0.7, label='X Output')
@@ -175,7 +177,8 @@ class LivePlotter:
         plt.show(block=False)
         
     def add_data(self, x_pos: float, y_pos: float, x_target: float, y_target: float,
-                 x_error: float, y_error: float, x_output: float, y_output: float):
+                 x_error: float, y_error: float, x_output: float, y_output: float,
+                 x_integral: float, y_integral: float):
         """
         Add new data point to the plot.
         
@@ -188,6 +191,8 @@ class LivePlotter:
             y_error: Y-axis error (m)
             x_output: X-axis PID output
             y_output: Y-axis PID output
+            x_integral: X-axis PID integral value
+            y_integral: Y-axis PID integral value
         """
         current_time = time.time() - self.start_time
         
@@ -201,6 +206,8 @@ class LivePlotter:
         self.y_errors.append(y_error)
         self.x_outputs.append(x_output)
         self.y_outputs.append(y_output)
+        self.x_integrals.append(x_integral)
+        self.y_integrals.append(y_integral)
         
     def update_plot(self):
         """Update the plot with current data (non-blocking)."""
@@ -217,6 +224,8 @@ class LivePlotter:
         y_error_array = np.array(self.y_errors)
         x_output_array = np.array(self.x_outputs)
         y_output_array = np.array(self.y_outputs)
+        x_integral_array = np.array(self.x_integrals)
+        y_integral_array = np.array(self.y_integrals)
         
         # Filter data to only show last window_size seconds
         current_time = times_array[-1]
@@ -231,6 +240,8 @@ class LivePlotter:
         y_error_windowed = y_error_array[mask]
         x_output_windowed = x_output_array[mask]
         y_output_windowed = y_output_array[mask]
+        x_integral_windowed = x_integral_array[mask]
+        y_integral_windowed = y_integral_array[mask]
         
         # Calculate magnitudes
         distance_from_target = np.sqrt(x_pos_windowed**2 + y_pos_windowed**2)
@@ -248,12 +259,9 @@ class LivePlotter:
             self.lines['current_pos'].set_offsets([[x_pos_windowed[-1], y_pos_windowed[-1]]])
             self.lines['target_pos'].set_offsets([[x_target_windowed[-1], y_target_windowed[-1]]])
         
-        # Update control vector scatter (show recent control directions)
-        if len(x_output_windowed) > 0:
-            # Create color array based on time (newer = brighter)
-            colors = times_windowed - times_windowed[0]  # Normalize to start at 0
-            self.control_scatter.set_offsets(np.c_[x_output_windowed, y_output_windowed])
-            self.control_scatter.set_array(colors)
+        # Update integral plot
+        self.lines['x_integral'].set_data(times_windowed, x_integral_windowed)
+        self.lines['y_integral'].set_data(times_windowed, y_integral_windowed)
         
         # Update component breakdown
         self.lines['x_output'].set_data(times_windowed, x_output_windowed)
@@ -289,12 +297,10 @@ class LivePlotter:
             self.ax_trajectory.set_xlim(x_range[0] - x_padding, x_range[1] + x_padding)
             self.ax_trajectory.set_ylim(y_range[0] - y_padding, y_range[1] + y_padding)
         
-        # Control vector plot: auto-scale with padding
-        if len(x_output_windowed) > 0:
-            output_range = max(np.max(np.abs(x_output_windowed)), np.max(np.abs(y_output_windowed)))
-            if output_range > 0:
-                self.ax_control_vector.set_xlim(-output_range * 1.1, output_range * 1.1)
-                self.ax_control_vector.set_ylim(-output_range * 1.1, output_range * 1.1)
+        # Integral plot: auto-scale with padding
+        self.ax_integral.relim()
+        self.ax_integral.autoscale_view()
+        self.ax_integral.set_xlim(current_time - self.window_size, current_time)
         
         # Redraw
         self.fig.canvas.draw()
@@ -381,6 +387,27 @@ class PIDController:
         self.integral = 0.0
         self.prev_error = 0.0
     
+    def set_prev_error(self, error: float):
+        """
+        Set previous error for bumpless transfer.
+        Used when transitioning from inactive to active control to prevent derivative kick.
+        
+        Args:
+            error: Error value to set as previous error
+        """
+        self.prev_error = error
+    
+    def update_error_tracking(self, error: float):
+        """
+        Update error tracking (prev_error) without computing output.
+        Used to continuously track error even when controller output is disabled,
+        ensuring smooth transitions when controller re-engages.
+        
+        Args:
+            error: Current error value
+        """
+        self.prev_error = error
+    
     def set_gains(self, Kp: float, Ki: float, Kd: float):
         """Update PID gains."""
         self.Kp = Kp
@@ -414,12 +441,18 @@ class ControlState:
         
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
-        self.Kp = 0.2975  # Proportional gain - increased for faster reaction
-        self.Ki = 0.206   # Integral gain - increased to eliminate steady-state error faster
-        self.Kd = 0.31   # Derivative gain - increased for better damping at higher speeds
+        # DEFAULT VALUES
+        self.Kp = 0.5  # Proportional gain 
+        self.Ki = 0.02   # Integral gain 
+        self.Kd = 0.4   # Derivative gain 
+        # self.Kp = 0.275  # Proportional gain - increased for faster reaction
+        # self.Ki = 0.0   # Integral gain - increased to eliminate steady-state error faster
+        # self.Kd = 0.0   # Derivative gain - increased for better damping at higher speeds
+        
+
         
         # Control parameters
-        self.max_tilt_angle = 8.0  # degrees (maximum platform tilt)
+        self.max_tilt_angle = 15.0  # degrees (maximum platform tilt)
         self.tilt_gain = 1.0  # Scaling factor from PID output to tilt - increased for faster response
         self.normal_filter_alpha = 1.0  # Smoothing on normal vector (0=no smoothing, 1=instant)
         
@@ -436,7 +469,7 @@ class ControlState:
         
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
-        self.centered_tolerance = 0.010  # meters (3mm margin)
+        self.centered_tolerance = 0.0005  # meters (3mm margin)
 
 
 class NormalController:
@@ -1420,6 +1453,9 @@ class ControlLoop:
         else:
             self.plotter = None
         
+        # Track previous centered state for bumpless transfer
+        self.prev_centered = None  # None = first iteration, True/False = previous state
+        
     def run(self):
         """Run main control loop."""
         print("="*70)
@@ -1511,16 +1547,32 @@ class ControlLoop:
                 is_centered = error_magnitude < self.state.centered_tolerance
                 self.state.ball_is_centered = is_centered
                 
-                # Update PID controllers
-                # If ball is centered (within tolerance), output zero
+                # Detect mode transition for bumpless transfer
+                just_switched_to_active = (self.prev_centered is True and not is_centered)
+                
+                # Update PID controllers with bumpless transfer
                 if is_centered:
                     # Ball is centered - set outputs to zero
+                    # But continue tracking error for smooth re-engagement (continuous tracking)
+                    self.pid_x.update_error_tracking(ex)
+                    self.pid_y.update_error_tracking(ey)
                     ux = 0.0
                     uy = 0.0
                 else:
                     # Ball is not centered - normal PID control
+                    # If just switched from centered to active, ensure bumpless transfer
+                    if just_switched_to_active:
+                        # Pre-load previous error to prevent derivative kick
+                        # This makes the first derivative calculation zero (or small)
+                        self.pid_x.set_prev_error(ex)
+                        self.pid_y.set_prev_error(ey)
+                    
+                    # Normal PID update
                     ux = self.pid_x.update(ex, x, dt)
                     uy = self.pid_y.update(ey, y, dt)
+                
+                # Update previous centered state for next iteration
+                self.prev_centered = is_centered
                 
                 # Add data to live plotter
                 if self.plotter is not None:
@@ -1532,7 +1584,9 @@ class ControlLoop:
                         x_error=ex,
                         y_error=ey,
                         x_output=ux,
-                        y_output=uy
+                        y_output=uy,
+                        x_integral=self.pid_x.integral,
+                        y_integral=self.pid_y.integral
                     )
                 
                 # Compute desired normal (includes filtering)
@@ -1611,6 +1665,310 @@ class ControlLoop:
             self.plotter.close()
         cv2.destroyAllWindows()
         self.state.running = False
+    
+    def run_ramp_test(self):
+        """
+        Run ramp test: smooth ramp from 0 to +10, hold, back to 0, hold.
+        Repeats for 3 iterations. Saves plot to tmp/ folder.
+        """
+        print("="*70)
+        print("Ramp Test Mode")
+        print("="*70)
+        print("Pattern: 0 → +10 (5s) → hold (5s) → 0 (5s) → hold (5s)")
+        print("Repeating for 3 iterations (60 seconds total)")
+        print("="*70)
+        
+        # Ramp parameters
+        ramp_duration = 5.0  # seconds to ramp up/down
+        hold_duration = 5.0  # seconds to hold at each position
+        max_position = 0.08  # meters
+        min_position = 0.0   # meters
+        num_iterations = 3
+        
+        # Calculate total test duration
+        cycle_duration = 2 * (ramp_duration + hold_duration)  # 20 seconds per cycle
+        total_duration = num_iterations * cycle_duration  # 60 seconds
+        
+        # Data storage for plotting
+        test_times = []
+        command_positions = []
+        output_positions = []
+        control_signals = []
+        
+        # Initialize UI (minimal - just for display)
+        cv2.namedWindow(self.ui_manager.window_name)
+        self.ui_manager.create_control_panel()
+        
+        # Set up callback for PID reset when parameters change
+        def reset_pids():
+            self.pid_x.reset()
+            self.pid_y.reset()
+            self.normal_controller.reset()
+        self.ui_manager.set_reset_callback(reset_pids)
+        
+        self.state.running = True
+        test_start_time = time.time()
+        self.start_time = test_start_time
+        self.state.last_update_time = test_start_time
+        
+        # Initialize targets
+        self.state.x_target = 0.0
+        self.state.y_target = 0.0
+        self.state.x_target_filtered = 0.0
+        self.state.y_target_filtered = 0.0
+        
+        # Initialize previous centered state
+        self.prev_centered = None
+        
+        print("[RAMP TEST] Starting test...")
+        
+        # Control loop
+        while self.state.running and not self.state.emergency_stop:
+            loop_start = time.time()
+            elapsed_time = time.time() - test_start_time
+            
+            # Check if test is complete
+            if elapsed_time >= total_duration:
+                print(f"[RAMP TEST] Test complete after {elapsed_time:.2f} seconds")
+                break
+            
+            # Calculate current command position based on elapsed time
+            cycle_time = elapsed_time % cycle_duration
+            cycle_num = int(elapsed_time / cycle_duration)
+            
+            # Determine which phase we're in within the current cycle
+            if cycle_time < ramp_duration:
+                # Ramping up: 0 → +10
+                phase = "ramp_up"
+                progress = cycle_time / ramp_duration
+                self.state.x_target = min_position + (max_position - min_position) * progress
+            elif cycle_time < ramp_duration + hold_duration:
+                # Holding at +10
+                phase = "hold_high"
+                self.state.x_target = max_position
+            elif cycle_time < 2 * ramp_duration + hold_duration:
+                # Ramping down: +10 → 0
+                phase = "ramp_down"
+                progress = (cycle_time - ramp_duration - hold_duration) / ramp_duration
+                self.state.x_target = max_position - (max_position - min_position) * progress
+            else:
+                # Holding at 0
+                phase = "hold_low"
+                self.state.x_target = min_position
+            
+            # Update camera and ball detection
+            self.camera_manager.update()
+            
+            # Update control panel display
+            self.ui_manager.update_control_panel()
+            
+            # Update PID gains and normal controller parameters
+            self.pid_x.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
+            self.pid_y.set_gains(self.state.Kp, self.state.Ki, self.state.Kd)
+            self.normal_controller.set_tilt_gain(self.state.tilt_gain)
+            self.normal_controller.set_max_tilt_angle(self.state.max_tilt_angle)
+            self.normal_controller.set_filter_alpha(self.state.normal_filter_alpha)
+            
+            # Get ball position
+            ball_pos = self.camera_manager.get_ball_position()
+            self.state.ball_position = ball_pos
+            
+            # Calculate dt from actual time elapsed
+            current_time = time.time()
+            dt = current_time - self.state.last_update_time
+            self.state.last_update_time = current_time
+            
+            # Clamp dt to reasonable range
+            dt = np.clip(dt, 0.001, 0.1)
+            
+            # Apply rate limiting to target setpoint (smooth reference changes)
+            max_delta = self.state.max_target_rate * dt
+            
+            # X-axis rate limiting
+            dx_target = self.state.x_target - self.state.x_target_filtered
+            if abs(dx_target) > max_delta:
+                dx_target = np.sign(dx_target) * max_delta
+            self.state.x_target_filtered += dx_target
+            
+            # Y-axis rate limiting (keep at 0 for this test)
+            dy_target = self.state.y_target - self.state.y_target_filtered
+            if abs(dy_target) > max_delta:
+                dy_target = np.sign(dy_target) * max_delta
+            self.state.y_target_filtered += dy_target
+            
+            # Control update (only if ball detected)
+            ux = 0.0
+            uy = 0.0
+            x_pos = 0.0
+            y_pos = 0.0
+            
+            if ball_pos is not None:
+                x, y = ball_pos
+                x_pos = x
+                y_pos = y
+                
+                # Compute errors using rate-limited setpoint
+                ex = self.state.x_target_filtered - x
+                ey = self.state.y_target_filtered - y
+                
+                # Check if ball is within centered tolerance
+                error_magnitude = np.sqrt(ex**2 + ey**2)
+                is_centered = error_magnitude < self.state.centered_tolerance
+                self.state.ball_is_centered = is_centered
+                
+                # Detect mode transition for bumpless transfer
+                just_switched_to_active = (self.prev_centered is True and not is_centered)
+                
+                # Update PID controllers with bumpless transfer
+                if is_centered:
+                    # Ball is centered - set outputs to zero
+                    # But continue tracking error for smooth re-engagement
+                    self.pid_x.update_error_tracking(ex)
+                    self.pid_y.update_error_tracking(ey)
+                    ux = 0.0
+                    uy = 0.0
+                else:
+                    # Ball is not centered - normal PID control
+                    if just_switched_to_active:
+                        # Pre-load previous error to prevent derivative kick
+                        self.pid_x.set_prev_error(ex)
+                        self.pid_y.set_prev_error(ey)
+                    
+                    # Normal PID update
+                    ux = self.pid_x.update(ex, x, dt)
+                    uy = self.pid_y.update(ey, y, dt)
+                
+                # Update previous centered state
+                self.prev_centered = is_centered
+                
+                # Compute desired normal (includes filtering)
+                n = self.normal_controller.compute_normal(ux, uy)
+                self.state.current_normal = n
+                self.state.filtered_normal = self.normal_controller.filtered_normal
+                
+                # Send to hardware via Arduino servo controller
+                self.servo_controller.set_normal(n[0], n[1], n[2])
+            
+            # Store data for plotting
+            test_times.append(elapsed_time)
+            command_positions.append(self.state.x_target_filtered)
+            output_positions.append(x_pos)
+            control_signals.append(ux)
+            
+            # Update display
+            frame = self.camera_manager.get_camera_frame()
+            if frame is not None:
+                overlay = self.ui_manager.draw_overlay(frame)
+                if overlay is not None:
+                    cv2.imshow(self.ui_manager.window_name, overlay)
+            
+            # Handle keyboard input (non-blocking)
+            key = cv2.waitKey(1) & 0xFF
+            if key != 255:
+                if key == ord('q'):
+                    print("[STOP] Test stopped by user")
+                    self.state.emergency_stop = True
+                    break
+            
+            # Enforce minimum sampling time
+            elapsed = time.time() - loop_start
+            if elapsed < self.target_dt:
+                time.sleep(self.target_dt - elapsed)
+        
+        # Cleanup: set platform to flat
+        print("[CLEANUP] Setting platform to flat")
+        self.servo_controller.set_normal(0.0, 0.0, 1.0)
+        self.camera_manager.close()
+        
+        # Close logger
+        self.logger.close()
+        
+        if self.plotter is not None:
+            self.plotter.close()
+        cv2.destroyAllWindows()
+        
+        # Create and save plot
+        print("[RAMP TEST] Creating plot...")
+        self._create_ramp_test_plot(test_times, command_positions, output_positions, control_signals)
+        
+        self.state.running = False
+    
+    def _create_ramp_test_plot(self, times, commands, outputs, controls):
+        """
+        Create and save ramp test plot.
+        
+        Args:
+            times: List of time values (seconds)
+            commands: List of command positions (meters)
+            outputs: List of output positions (meters)
+            controls: List of control signals
+        """
+        # Create tmp directory if it doesn't exist
+        import os
+        os.makedirs("tmp", exist_ok=True)
+        
+        # Create figure with 3 subplots
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        fig.suptitle('Ramp Test Results', fontsize=14, fontweight='bold')
+        
+        # Convert to numpy arrays
+        times_array = np.array(times)
+        outputs_array = np.array(outputs)
+        commands_array = np.array(commands)
+        controls_array = np.array(controls)
+        
+        # Clip data to start at 1 second
+        mask = times_array >= 1.0
+        times_array = times_array[mask]
+        outputs_array = outputs_array[mask]
+        commands_array = commands_array[mask]
+        controls_array = controls_array[mask]
+        
+        # Calculate error
+        errors = commands_array - outputs_array
+        
+        # Plot 1: X Ball Position and X Command Position (overlayed)
+        ax1 = axes[0]
+        ax1.plot(times_array, commands_array, 'b-', linewidth=2, label='X Command', alpha=0.7)
+        ax1.plot(times_array, outputs_array, 'r-', linewidth=1.5, label='X Ball Position', alpha=0.8)
+        ax1.set_ylabel('X Position (m)', fontweight='bold')
+        ax1.set_title('X Position: Command vs Ball', fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc='upper right')
+        
+        # Plot 2: X Control Signal
+        ax2 = axes[1]
+        ax2.plot(times_array, controls_array, 'g-', linewidth=1.5, label='X Control Signal')
+        ax2.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
+        ax2.set_ylabel('X Control Signal', fontweight='bold')
+        ax2.set_title('X Control Signal', fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right')
+        
+        # Plot 3: X Tracking Error
+        ax3 = axes[2]
+        ax3.plot(times_array, errors, 'm-', linewidth=1.5, label='X Error (Command - Ball)')
+        ax3.axhline(0, color='k', linewidth=0.5, linestyle='--', alpha=0.5)
+        ax3.set_xlabel('Time (s)', fontweight='bold')
+        ax3.set_ylabel('X Error (m)', fontweight='bold')
+        ax3.set_title('X Tracking Error', fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc='upper right')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"tmp/ramp_test_{timestamp}.png"
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        print(f"[RAMP TEST] Plot saved to: {filename}")
+        
+        # Also save as PDF for better quality
+        pdf_filename = f"tmp/ramp_test_{timestamp}.pdf"
+        plt.savefig(pdf_filename, bbox_inches='tight')
+        print(f"[RAMP TEST] Plot saved to: {pdf_filename}")
+        
+        plt.close(fig)
 
 def main():
     """Main entry point."""
@@ -1623,6 +1981,7 @@ Examples:
   python PID_3d.py                          # Run without camera calibration
   python PID_3d.py cal/camera_calib.npz      # Run with camera calibration
   python PID_3d.py --no-plot                # Run without live plotting
+  python PID_3d.py --ramp-test              # Run ramp test (saves plot to tmp/)
         """
     )
     parser.add_argument(
@@ -1642,6 +2001,11 @@ Examples:
         default=0.0,
         help='Force minimum sampling time (s) to simulate discrete/slow plant'
     )
+    parser.add_argument(
+        '--ramp-test',
+        action='store_true',
+        help='Run ramp test: smooth ramp from 0 to +10, hold, back to 0, hold. Repeats 3 times. Saves plot to tmp/'
+    )
     args = parser.parse_args()
     
     print("="*70)
@@ -1660,6 +2024,10 @@ Examples:
         
     if args.dt > 0:
         print(f"[CONFIG] Forced Sampling Time: {args.dt}s ({1/args.dt:.1f} Hz)")
+    
+    if args.ramp_test:
+        print("[CONFIG] Ramp test mode: ENABLED")
+        print("[CONFIG] Live plotting: DISABLED (ramp test creates its own plot)")
     print("="*70)
     
     # Initialize components
@@ -1689,12 +2057,17 @@ Examples:
     )
     
     # Create and run control loop
+    # Disable plotting for ramp test (it creates its own plot)
+    enable_plotting = not args.no_plot and not args.ramp_test
     control_loop = ControlLoop(state, camera_manager, normal_controller, ui_manager, 
-                               servo_controller, enable_plotting=not args.no_plot,
-                               target_dt=args.dt)  # <-- Pass dt here
+                               servo_controller, enable_plotting=enable_plotting,
+                               target_dt=args.dt)
     
     try:
-        control_loop.run()
+        if args.ramp_test:
+            control_loop.run_ramp_test()
+        else:
+            control_loop.run()
     except KeyboardInterrupt:
         print("\n[STOP] Interrupted by user")
         state.emergency_stop = True
