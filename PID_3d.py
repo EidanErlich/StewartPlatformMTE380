@@ -502,7 +502,7 @@ class ControlState:
         self.y_target = 0.0
         
         # Ball radius (meters) - physical radius of the ball
-        self.ball_radius = 0.01  # 1cm radius (typical ping pong ball)
+        self.ball_radius = 0.015  # 1.5cm radius
         
         # Rate-limited target position (smooth setpoint changes)
         self.x_target_filtered = 0.0
@@ -511,14 +511,14 @@ class ControlState:
         
         # PID gains (same for both x and y axes)
         # Tuned for faster response while maintaining stability
-        # DEFAULT VALUES
+        # # DEFAULT VALUES
         self.Kp = 0.45  # Proportional gain 
-        self.Ki = 0.044   # Integral gain 
+        self.Ki = 0.09   # Integral gain 
         self.Kd = 0.528   # Derivative gain 
-        # 
-        # self.Kp = 0.45  # Proportional gain 
-        # self.Ki = 0.035   # Integral gain 
-        # self.Kd = 0.56   # Derivative gain 
+        
+        # self.Kp = 0.2975  # Proportional gain - increased for faster reaction
+        # self.Ki = 0.206   # Integral gain - increased to eliminate steady-state error faster
+        # self.Kd = 0.31   # Derivative gain - increased for better damping at higher speeds
         
 
         
@@ -540,7 +540,7 @@ class ControlState:
         
         # Centered margin: if error magnitude is below this, ball is considered centered
         # and control output is set to zero (prevents micro-adjustments)
-        self.centered_tolerance = 0.01  # meters (3mm margin)
+        self.centered_tolerance = 0.005  # meters (3mm margin)
 
 
 class NormalController:
