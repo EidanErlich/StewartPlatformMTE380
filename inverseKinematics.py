@@ -1,6 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import argparse
+import serial
+import serial.tools.list_ports
+import time
 
 
 # === GLOBAL PARAMETERS (update as needed) === (All units in cm)
@@ -149,10 +153,30 @@ class StewartPlatform:
 
 
 class StewartPlatformVisualizer:
-	def __init__(self, platform: StewartPlatform):
+	def __init__(self, platform: StewartPlatform, arduino_serial=None):
 		self.platform = platform
 		self.fig = None
 		self.ax = None
+		self.arduino_serial = arduino_serial
+
+	def send_to_arduino(self, angles_deg):
+		"""Send servo angles to Arduino in degrees"""
+		if self.arduino_serial and self.arduino_serial.is_open:
+			# Format: "angle0,angle1,angle2\n"
+			command = f"{int(angles_deg[0])},{int(angles_deg[1])},{int(angles_deg[2])}\n"
+			self.arduino_serial.write(command.encode())
+			
+			# Read response
+			time.sleep(0.05)
+			if self.arduino_serial.in_waiting:
+				response = self.arduino_serial.readline().decode('utf-8', errors='ignore').strip()
+				if response.startswith('OK:'):
+					print(f"Arduino: {response}")
+					return True
+				elif response.startswith('ERR:'):
+					print(f"Arduino error: {response}")
+					return False
+		return False
 
 	def plot(self, plate_normal=[0,0,1], interactive=False):
 		# Recalculate servo angles for the current orientation
@@ -222,20 +246,94 @@ class StewartPlatformVisualizer:
 		angles_deg = np.degrees(self.platform.servo_angles)
 		self.ax.set_title(f'Stewart Platform\nServo Angles: [{angles_deg[0]:.1f}°, {angles_deg[1]:.1f}°, {angles_deg[2]:.1f}°]')
 		
+		# Send to Arduino if connected
+		if self.arduino_serial:
+			# Calculate command angles with offsets and clamping
+			command_angles_deg = self.platform.calculate_servo_angles(
+				plate_normal,
+				degrees=True,
+				apply_offsets=True,
+				clamp_min=0.0,
+				clamp_max=65.0
+			)
+			self.send_to_arduino(command_angles_deg)
+		
 		if interactive:
 			self.fig.canvas.draw()
 			self.fig.canvas.flush_events()
 		else:
 			plt.show()
 
+def find_arduino_port():
+	"""Auto-detect Arduino port"""
+	ports = serial.tools.list_ports.comports()
+	for p in ports:
+		# Look for common Arduino USB identifiers
+		if 'usbmodem' in p.device or 'usbserial' in p.device or 'Arduino' in str(p.description):
+			print(f"Found Arduino on: {p.device}")
+			return p.device
+	return None
+
+def connect_arduino(port=None, baud=115200):
+	"""Connect to Arduino via serial"""
+	if port is None:
+		port = find_arduino_port()
+	
+	if not port:
+		print("No Arduino found. Running in simulation mode only.")
+		return None
+	
+	try:
+		ser = serial.Serial(port, baud, timeout=1)
+		time.sleep(2)  # Wait for Arduino to reset
+		
+		# Read startup messages
+		while ser.in_waiting:
+			line = ser.readline().decode('utf-8', errors='ignore').strip()
+			print(f"Arduino: {line}")
+		
+		print(f"Connected to Arduino on {port} at {baud} baud")
+		print("Initializing all servos to 0 degrees...")
+		# Send all servos to 0 degrees directly
+		command = "0,0,0\n"
+		ser.write(command.encode())
+		time.sleep(0.1)
+		if ser.in_waiting:
+			response = ser.readline().decode('utf-8', errors='ignore').strip()
+			print(f"Arduino: {response}")
+		print("Servos initialized: [0°, 0°, 0°]")
+		return ser
+		
+	except serial.SerialException as e:
+		print(f"Failed to connect to {port}: {e}")
+		print("Running in simulation mode only.")
+		return None
+
 def main():
+	# Parse command line arguments
+	parser = argparse.ArgumentParser(description='Stewart Platform Visualizer')
+	parser.add_argument('--update-real', action='store_true', 
+						help='Send servo angles to Arduino in real-time')
+	parser.add_argument('--port', type=str, default=None,
+						help='Arduino serial port (auto-detect if not specified)')
+	parser.add_argument('--baud', type=int, default=115200,
+						help='Serial baud rate (default: 115200)')
+	args = parser.parse_args()
+	
+	# Connect to Arduino if requested
+	arduino_serial = None
+	if args.update_real:
+		arduino_serial = connect_arduino(args.port, args.baud)
+		if arduino_serial is None:
+			print("Warning: Could not connect to Arduino. Continuing in simulation mode.")
+	
 	plt.ion()  # Enable interactive mode
 	platform = StewartPlatform()
 	
 	# Initialize servos to 0 degrees manually
 	platform.servo_angles = np.array([0.0, 0.0, 0.0])
 	
-	visualizer = StewartPlatformVisualizer(platform)
+	visualizer = StewartPlatformVisualizer(platform, arduino_serial)
 	# Initial normal vector (vertical)
 	normal = np.array([0, 0, 1], dtype=float)
 	
@@ -289,7 +387,13 @@ def main():
 	# Connect key press event
 	visualizer.fig.canvas.mpl_connect('key_press_event', on_key)
 	
-	plt.show(block=True)
+	try:
+		plt.show(block=True)
+	finally:
+		# Clean up Arduino connection
+		if arduino_serial and arduino_serial.is_open:
+			print("\nClosing Arduino connection...")
+			arduino_serial.close()
 
 if __name__ == "__main__":
 	main()
